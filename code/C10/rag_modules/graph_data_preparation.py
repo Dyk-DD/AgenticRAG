@@ -49,7 +49,8 @@ class MedicalDataPreparationModule:
         self.qa_pairs = []
 
         # 1. 加载疾病本地词典
-        self.disease_dict = self._load_disease_dict(r"E:\AI_Project\all-in-rag-main\data\C10\disease_dict.txt")
+        disease_dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "data", "C10", "disease_dict.txt")
+        self.disease_dict = self._load_disease_dict(disease_dict_path)
         logger.info(f"成功加载本地疾病词典，共包含 {len(self.disease_dict)} 个疾病条目")
 
         # # 2. 加载适应 6G 显存的本地小模型 (如 Qwen2.5-1.5B-Instruct)

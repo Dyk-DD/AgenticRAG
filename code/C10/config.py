@@ -2,6 +2,7 @@
 基于图数据库的临床决策辅助RAG系统配置文件
 """
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Any
 
@@ -11,7 +12,7 @@ class GraphRAGConfig:
 
     # === 医学数据路径配置 ===
     # 将包含 CSV 问答对的文件夹路径配置在这里
-    medical_csv_dir: str = r"E:\AI_Project\changeme-main\data\C10\Data_CSV"
+    medical_csv_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "C10", "Data_CSV")
 
     # === Neo4j数据库配置 ===
     neo4j_uri: str = "bolt://localhost:7687"
