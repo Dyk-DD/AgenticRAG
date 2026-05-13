@@ -173,7 +173,7 @@ Agentic-RAG/
 │   ├── raw/              # 原始 CSV 数据 (6 科室 ~86k QA)
 │   ├── processed/         # 处理后数据
 │   ├── disease_dict.txt   # 疾病词典 (~1000 条目)
-│   ├── test_20.csv        # 测试数据
+│   ├── test_100.csv        # 测试数据
 │   ├── images/            # 医学流程图
 │   └── neo4j/             # Neo4j 持久化 (gitignored)
 │
@@ -217,7 +217,7 @@ Agentic-RAG/
 | `neo4j_uri` | `bolt://localhost:8687` | Neo4j 连接 |
 | `milvus_host` / `milvus_port` | `localhost:19530` | Milvus 连接 |
 | `embedding_model` | `<auto>/models/bge-base-zh-v1.5` | 嵌入模型路径 |
-| `llm_model` | `deepseek-chat` | 生成模型 |
+| `llm_model` | `deepseek-v4-flash` | 生成模型 |
 | `top_k` | `5` | 检索返回数 |
 | `temperature` | `0.1` | 生成温度 |
 | `memory_enabled` | `True` | 启用记忆模块 |
