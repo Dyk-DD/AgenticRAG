@@ -72,6 +72,9 @@ models/**/Constant_7_attr__value
 .cache/modelscope/
 .cargo
 
+# Frontend (separate repo -> Dyk-DD.github.io)
+frontend/
+
 # LLM API keys
 *.key
 *.secret
