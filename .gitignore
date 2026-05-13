@@ -54,6 +54,9 @@ Thumbs.db
 # Docker volumes (Milvus/MinIO/etcd runtime data)
 volumes/
 
+# Data files
+data/
+
 # Neo4j runtime data
 data/neo4j/
 
