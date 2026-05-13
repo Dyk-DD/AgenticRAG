@@ -42,6 +42,7 @@ class QADatabase:
                     strategy TEXT,
                     complexity REAL,
                     routing_reasoning TEXT,
+                    retrieved_docs TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 )
@@ -49,6 +50,11 @@ class QADatabase:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_qa_session ON qa_records(session_id)
             """)
+            # Migration: add retrieved_docs column if missing
+            try:
+                conn.execute("ALTER TABLE qa_records ADD COLUMN retrieved_docs TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     def create_session(self, session_id: str):
         with self._connect() as conn:
@@ -73,6 +79,7 @@ class QADatabase:
         strategy: str = "unknown",
         complexity: float = 0.0,
         routing_reasoning: str = "",
+        retrieved_docs: str = "",
     ):
         with self._connect() as conn:
             max_turn = conn.execute(
@@ -80,9 +87,9 @@ class QADatabase:
                 (session_id,),
             ).fetchone()[0]
             conn.execute(
-                "INSERT INTO qa_records (session_id, turn_index, question, answer, strategy, complexity, routing_reasoning, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (session_id, max_turn + 1, question, answer, strategy, complexity, routing_reasoning, time.strftime("%Y-%m-%dT%H:%M:%S")),
+                "INSERT INTO qa_records (session_id, turn_index, question, answer, strategy, complexity, routing_reasoning, retrieved_docs, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, max_turn + 1, question, answer, strategy, complexity, routing_reasoning, retrieved_docs, time.strftime("%Y-%m-%dT%H:%M:%S")),
             )
         logger.info(f"QA recorded in SQLite: {session_id} turn {max_turn + 1}")
 
@@ -102,7 +109,7 @@ class QADatabase:
             if not ses:
                 return None
             turns = conn.execute(
-                "SELECT question, answer, strategy, complexity, routing_reasoning, created_at "
+                "SELECT question, answer, strategy, complexity, routing_reasoning, retrieved_docs, created_at "
                 "FROM qa_records WHERE session_id = ? ORDER BY turn_index",
                 (session_id,),
             ).fetchall()
@@ -116,6 +123,7 @@ class QADatabase:
                     "strategy": t["strategy"] or "",
                     "complexity": t["complexity"] or 0,
                     "timestamp": t["created_at"],
+                    "retrieved_docs": t["retrieved_docs"] or "[]",
                 } for t in turns],
             }
 
