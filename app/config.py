@@ -12,10 +12,10 @@ class GraphRAGConfig:
 
     # === 医学数据路径配置 ===
     # 将包含 CSV 问答对的文件夹路径配置在这里
-    medical_csv_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "C10", "Data_CSV")
+    medical_csv_dir: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "processed")
 
     # === Neo4j数据库配置 ===
-    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_uri: str = "bolt://localhost:8687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "changeme"
     neo4j_database: str = "neo4j"
@@ -23,13 +23,13 @@ class GraphRAGConfig:
     # === Milvus配置 ===
     milvus_host: str = "localhost"
     milvus_port: int = 19530
-    # 将集合名称从烹饪(cooking)修改为临床(clinical)
+    # 修改为临床(clinical)
     milvus_collection_name: str = "clinical_qa_knowledge"
     milvus_dimension: int = 768  # BGE-base-zh-v1.5的向量维度
 
     # === 模型配置 ===
-    embedding_model: str = "../models/bge-base-zh-v1.5"
-    llm_model: str = "deepseek-chat"
+    embedding_model: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "bge-base-zh-v1.5")
+    llm_model: str = "deepseek-v4-flash"
 
     # === 检索配置（Round-robin策略） ===
     top_k: int = 5
@@ -43,7 +43,16 @@ class GraphRAGConfig:
     # 虽然在医学问答(一条CSV一完整Chunk)中不截断，但保留兼容配置以防后续添加长篇医疗文献
     chunk_size: int = 500
     chunk_overlap: int = 50
-    max_graph_depth: int = 2  # 临床图遍历最大深度
+    max_graph_depth: int = 3  # 临床图遍历最大深度
+
+    # === 记忆模块配置 ===
+    memory_enabled: bool = True
+    memory_buffer_size: int = 10
+    memory_milvus_collection: str = "conversation_memory"
+    memory_top_k: int = 3
+    memory_summary_threshold: int = 10
+    memory_batch_flush_size: int = 5
+    memory_max_context_chars: int = 2000
 
     def __post_init__(self):
         """初始化后的处理"""
@@ -74,7 +83,14 @@ class GraphRAGConfig:
             'max_tokens': self.max_tokens,
             'chunk_size': self.chunk_size,
             'chunk_overlap': self.chunk_overlap,
-            'max_graph_depth': self.max_graph_depth
+            'max_graph_depth': self.max_graph_depth,
+            'memory_enabled': self.memory_enabled,
+            'memory_buffer_size': self.memory_buffer_size,
+            'memory_milvus_collection': self.memory_milvus_collection,
+            'memory_top_k': self.memory_top_k,
+            'memory_summary_threshold': self.memory_summary_threshold,
+            'memory_batch_flush_size': self.memory_batch_flush_size,
+            'memory_max_context_chars': self.memory_max_context_chars
         }
 
 # 提供一个默认的实例化对象供全局导入调用

@@ -28,9 +28,10 @@ from rag_modules.generation_integration import GenerationIntegrationModule
 from rag_modules.hybrid_retrieval import HybridRetrievalModule
 from rag_modules.graph_rag_retrieval import GraphRAGRetrieval
 from rag_modules.intelligent_query_router import IntelligentQueryRouter
+from rag_modules.conversation_memory import ConversationMemory
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 class ClinicalDecisionSystem:
     """
@@ -64,7 +65,11 @@ class ClinicalDecisionSystem:
         self.traditional_retrieval = None
         self.graph_rag_retrieval = None
         self.router = None
-        
+
+        # 记忆模块
+        self.memory_module = None
+        self.current_session_id = None
+
         # 系统状态
         self.system_ready = False
 
@@ -116,40 +121,58 @@ class ClinicalDecisionSystem:
             config=self.config
         )
 
+        # 6. 对话记忆模块
+        self.memory_module = ConversationMemory(
+            config=self.config,
+            llm_client=self.llm_client,
+            data_module=self.data_module,
+            milvus_module=self.index_module
+        )
+        self.memory_module.initialize()
+
         logger.info("系统组件初始化完成")
 
     def build_knowledge_base(self):
-        """构建临床知识库：解析CSV、构建图谱与向量索引"""
+        """构建临床知识库：解析CSV、构建图谱与向量索引（带增量检测）"""
         logger.info("开始构建临床知识库...")
 
-        # 1. 加载 CSV 医疗问答数据
-        self.data_module.load_csv_data()
+        neo4j_needs_update = self.data_module.check_graph_needs_update()
+        milvus_exists = self.index_module.has_collection()
 
-        # 2. 检查并构建 Neo4j 图谱
-        if self.data_module.check_graph_needs_update():  # 改用新的方法名
-            logger.info("开始执行图谱写入/增量更新...")
-            self.data_module.build_neo4j_graph()
+        if not neo4j_needs_update and milvus_exists:
+            # 完全同步：仅加载 CSV 用于检索器初始化，跳过图谱和向量构建
+            logger.info("Neo4j 和 Milvus 数据已同步，跳过索引构建")
+            self.data_module.load_csv_data()
+            chunks = self.data_module.build_chunks()
         else:
-            logger.info("✅ 图数据库 (Neo4j) 数据已同步。跳过耗时的写入步骤。")
+            self.data_module.load_csv_data()
 
-        # 3. 构建医疗文档与块 (按照一条QA一个Chunk的逻辑)
-        docs = self.data_module.build_medical_documents()
-        chunks = self.data_module.chunk_documents()
+            if neo4j_needs_update:
+                logger.info("开始执行图谱写入/增量更新...")
+                self.data_module.build_neo4j_graph()
+            else:
+                logger.info("图数据库 (Neo4j) 数据已同步，跳过写入步骤")
 
-        # 4. 构建或加载 Milvus 向量索引
-        if not self.index_module.has_collection():
-            logger.info("向量集合不存在，开始构建...")
-            self.index_module.build_vector_index(chunks)
-        else:
-            logger.info("向量集合已存在，直接加载...")
-            self.index_module.load_collection()
+            chunks = self.data_module.build_chunks()
 
-        # 5. 初始化检索器底层数据结构 (包括加载Neo4j图谱)
+            milvus_rows = self.index_module.get_row_count() if milvus_exists else 0
+            if not milvus_exists or milvus_rows < len(chunks):
+                if milvus_exists and milvus_rows > 0:
+                    logger.info(f"检测到新增数据 (Milvus: {milvus_rows}, 本地: {len(chunks)})，重建索引")
+                self.index_module.build_vector_index(chunks)
+            else:
+                logger.info("向量集合已存在且数据同步，直接加载")
+                self.index_module.load_collection()
+
+        # 初始化检索器（含 Neo4j 图索引预热）
         self.traditional_retrieval.initialize(chunks)
         self.graph_rag_retrieval.initialize()
 
-        # 👇 就是补上下面这一行代码 👇
         self.system_ready = True
+
+        # 创建记忆会话
+        if self.memory_module:
+            self.current_session_id = self.memory_module.create_session()
 
         logger.info("临床知识库构建与就绪完成！")
 
@@ -216,6 +239,16 @@ class ClinicalDecisionSystem:
         start_time = time.time()
 
         try:
+            # 0. 召回对话记忆上下文
+            memory_context = ""
+            if self.memory_module and self.current_session_id:
+                print("🧠 正在召回对话记忆...")
+                memory_context = self.memory_module.retrieve_memory_context(
+                    question, self.current_session_id
+                )
+                if memory_context:
+                    print("   ✅ 记忆上下文已加载")
+
             # 1. 智能路由检索
             print("执行智能临床查询路由...")
             relevant_docs, analysis = router.route_query(question, self.config.top_k)
@@ -234,7 +267,6 @@ class ClinicalDecisionSystem:
             if relevant_docs:
                 doc_info = []
                 for doc in relevant_docs:
-                    # 替换烹饪的 recipe_name 为医学的 title / department
                     title = doc.metadata.get('title', '未知病例')
                     search_type = doc.metadata.get('search_type', doc.metadata.get('route_strategy', 'unknown'))
                     score = doc.metadata.get('final_score', doc.metadata.get('relevance_score', 0))
@@ -251,19 +283,31 @@ class ClinicalDecisionSystem:
 
             if stream:
                 try:
-                    for chunk_text in self.generation_module.generate_adaptive_answer_stream(question, relevant_docs):
+                    for chunk_text in self.generation_module.generate_adaptive_answer_stream(question, relevant_docs, memory_context):
                         print(chunk_text, end="", flush=True)
                     print("\n")
                     result = "流式输出完成"
                 except Exception as stream_error:
                     logger.error(f"流式输出过程中出现错误: {stream_error}")
                     print(f"\n⚠️ 网络或流式输出中断，正在为您切换到标准模式...")
-                    result = self.generation_module.generate_adaptive_answer(question, relevant_docs)
+                    result = self.generation_module.generate_adaptive_answer(question, relevant_docs, memory_context)
                     print(result)
             else:
-                result = self.generation_module.generate_adaptive_answer(question, relevant_docs)
+                result = self.generation_module.generate_adaptive_answer(question, relevant_docs, memory_context)
 
-            # 5. 性能统计
+            # 5. 记录本轮对话到记忆
+            if self.memory_module and self.current_session_id:
+                extracted = self.memory_module.extract_referenced_entities(question, str(result))
+                self.memory_module.record_turn(
+                    session_id=self.current_session_id,
+                    question=question,
+                    answer=str(result),
+                    strategy=analysis.recommended_strategy.value if analysis else "unknown",
+                    complexity=analysis.query_complexity if analysis else 0.0,
+                    extracted_entities=extracted
+                )
+
+            # 6. 性能统计
             end_time = time.time()
             print(f"\n⏱️ 诊断处理完成，耗时: {end_time - start_time:.2f}秒")
 
@@ -296,6 +340,8 @@ class ClinicalDecisionSystem:
                     continue
 
                 if user_input.lower() in ['quit', 'q', 'exit']:
+                    if self.memory_module and self.current_session_id:
+                        self.memory_module.close_session(self.current_session_id)
                     break
                 elif user_input.lower() == 'stats':
                     self._show_system_stats()
@@ -352,6 +398,14 @@ class ClinicalDecisionSystem:
             else:
                 print("暂无临床问诊记录")
 
+        # 记忆模块统计
+        if getattr(self, 'memory_module', None):
+            mem_stats = self.memory_module.get_statistics()
+            print(f"   记忆模块: {'启用' if mem_stats.get('memory_enabled') else '禁用'}")
+            print(f"   短期缓冲: {mem_stats.get('buffer_size', 0)} 轮")
+            print(f"   图记忆 (Neo4j): {'就绪' if mem_stats.get('neo4j_ready') else '未连接'}")
+            print(f"   语义记忆 (Milvus): {'就绪' if mem_stats.get('milvus_ready') else '未连接'}")
+
         self._show_knowledge_base_stats()
 
     def _rebuild_knowledge_base(self):
@@ -382,8 +436,9 @@ class ClinicalDecisionSystem:
     
     def _cleanup(self):
         """清理资源"""
+        if getattr(self, 'memory_module', None) and self.current_session_id:
+            self.memory_module.close_session(self.current_session_id)
         if getattr(self, 'data_module', None):
-            # 适配可能没有 close 方法的模块
             if hasattr(self.data_module, 'close'): self.data_module.close()
         if getattr(self, 'traditional_retrieval', None):
             self.traditional_retrieval.close()
@@ -391,6 +446,8 @@ class ClinicalDecisionSystem:
             self.graph_rag_retrieval.close()
         if getattr(self, 'index_module', None):
             self.index_module.close()
+        if getattr(self, 'memory_module', None):
+            self.memory_module.close()
 
     def add_new_knowledge(self, csv_filepath: str):
         """增量添加新知识：处理全新的CSV文件并追加到数据库"""

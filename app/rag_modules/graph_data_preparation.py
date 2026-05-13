@@ -3,11 +3,9 @@
 """
 
 import logging
-import torch
 import json
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import pandas as pd
 import os
 import re
@@ -48,94 +46,36 @@ class MedicalDataPreparationModule:
         self.chunks = []
         self.qa_pairs = []
 
-        # 1. 加载疾病本地词典
-        disease_dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "data", "C10", "disease_dict.txt")
+        # 1. 加载疾病本地词典并编译正则（O(N) 匹配，替代 O(N×D) 暴力循环）
+        disease_dict_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data", "disease_dict.txt")
         self.disease_dict = self._load_disease_dict(disease_dict_path)
+        self._disease_pattern = self._build_disease_pattern()
         logger.info(f"成功加载本地疾病词典，共包含 {len(self.disease_dict)} 个疾病条目")
-
-        # # 2. 加载适应 6G 显存的本地小模型 (如 Qwen2.5-1.5B-Instruct)
-        # # 注意替换为您本地的模型路径
-        # local_model_path = r"E:\AI_Project\models\Qwen2.5-1.5B-Instruct"
-        # try:
-        #     logger.info("正在加载 1.5B 轻量级医学抽取模型...")
-        #     self.tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True)
-        #     # 6G 显存使用 bfloat16 或 float16 加载 1.5B 模型毫无压力
-        #     self.model = AutoModelForCausalLM.from_pretrained(
-        #         local_model_path,
-        #         device_map="auto",
-        #         torch_dtype=torch.float16,
-        #         trust_remote_code=True
-        #     ).eval()
-        #     logger.info("轻量级 LLM 加载完成！")
-        # except Exception as e:
-        #     logger.error(f"轻量级模型加载失败，将仅使用词典匹配模式: {e}")
-        #     self.model = None
 
         self._connect()
 
     def _load_disease_dict(self, filepath: str) -> list:
-        """加载本地疾病词典"""
+        "加载本地疾病词典"
         if not os.path.exists(filepath):
             logger.warning(f"未找到疾病词典文件: {filepath}")
             return []
         with open(filepath, 'r', encoding='utf-8') as f:
-            # 过滤空行并去重
-            return list(set([line.strip() for line in f if line.strip()]))
+            return sorted(set([line.strip() for line in f if line.strip()]), key=len, reverse=True)
+
+    def _build_disease_pattern(self):
+        "编译疾病词典为单个正则，利用 re 内部 trie 优化实现 O(N) 文本扫描"
+        if not self.disease_dict:
+            return None
+        escaped = [re.escape(d) for d in self.disease_dict]
+        return re.compile('|'.join(escaped))
 
     def _extract_diseases_by_dict(self, title: str, ask: str, answer: str) -> list:
-        """
-        双引擎抽取：极速词典匹配 + 小模型语义兜底
-        """
+        "编译正则单次扫描提取所有匹配疾病"
         combined_text = f"{title} {ask} {answer}"
-        extracted_diseases = set()
-
-        # 引擎 1：极速词典匹配（优先）
-        for disease in self.disease_dict:
-            if disease in combined_text:
-                extracted_diseases.add(disease)
-
-        return list(extracted_diseases)
-
-        # # 如果词典已经匹配到了核心疾病，直接返回，跳过 LLM 以节省时间
-        # if extracted_diseases:
-        #     return list(extracted_diseases)
-
-        # # 引擎 2：如果词典未命中，且模型加载成功，则调用小模型兜底
-        # if self.model is None:
-        #     return []
-        #
-        # prompt = f"""
-        # 从以下临床记录中提取1个最核心的疾病名称。
-        # 记录：{combined_text[:300]}
-        # 请只返回疾病名称本身（如“高血压”），不要返回多余的解释。如果没病，返回“无”。
-        # """
-        #
-        # messages = [{"role": "user", "content": prompt}]
-        #
-        # try:
-        #     text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        #     model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
-        #
-        #     generated_ids = self.model.generate(
-        #         model_inputs.input_ids,
-        #         max_new_tokens=10,  # 只需要几个字，极大提升生成速度
-        #         temperature=0.1,
-        #         do_sample=False
-        #     )
-        #
-        #     generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in
-        #                      zip(model_inputs.input_ids, generated_ids)]
-        #     result = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        #
-        #     # 清理小模型可能带有的标点或换行
-        #     result = result.replace('。', '').replace('”', '').replace('“', '').strip()
-        #
-        #     if result and result != "无" and len(result) < 15:
-        #         return [result]
-        #     return []
-        #
-        # except Exception as e:
-        #     return []
+        if not self._disease_pattern:
+            return []
+        matches = self._disease_pattern.findall(combined_text)
+        return list(set(matches))
     
     def _connect(self):
         """建立Neo4j连接"""
@@ -312,83 +252,53 @@ class MedicalDataPreparationModule:
             logger.error(f"❌ 批量写入 Neo4j 失败: {e}")
 
     def build_medical_documents(self) -> List[Document]:
-        """
-        构建医学问答文档，一条问答对作为一个完整文档
-        [优化]：问答解耦。仅将问题和症状作为 page_content 进行向量化，将长篇医生建议保存在 metadata 中。
-        """
-        logger.info("正在构建医学问答文档...")
-        documents = []
+        "构建医学问答文档（保留兼容接口，内部调用合并方法）"
+        return self.build_chunks()
 
-        for idx, qa in enumerate(self.qa_pairs):
+    def chunk_documents(self, chunk_size: int = 500, chunk_overlap: int = 50) -> List[Document]:
+        "封装医学问答块（保留兼容接口，内部调用合并方法）"
+        return self.build_chunks()
+
+    def build_chunks(self) -> List[Document]:
+        "一次遍历直接生成 chunks：合并 build_medical_documents + chunk_documents，减少全量遍历"
+        logger.info("正在构建医学问答块（文档+chunk 合并单次遍历）...")
+        chunks = []
+
+        for qa in self.qa_pairs:
             try:
-                # 1. 结构化拼接文本内容
-                # 【修改点】：去掉了 qa['answer']，让向量模型只关注患者的“症状”和“问题”
                 content = (
                     f"【历史病例_所属科室】：{qa['department']}\n"
                     f"【历史病例_核心问题】：{qa['title']}\n"
                     f"【历史病例_患者主诉/提问】：{qa['ask']}"
                 )
-
-                # 2. 生成基于内容的唯一哈希 ID
                 node_id = self._generate_node_id(qa)
 
-                # 3. 挂载结构化元数据 (Metadata)
-                doc = Document(
+                chunk = Document(
                     page_content=content,
                     metadata={
-                        "node_id": node_id,  # 使用哈希ID
-                        "department": qa['department'],  # 用于向量库的元数据过滤
-                        "title": qa['title'],
-                        "ask": qa['ask'],  # 【新增】：保存原始提问
-                        "answer": qa['answer'],  # 【新增】：将长篇答案保存在元数据中，供大模型生成时使用
+                        "node_id": node_id,
+                        "department": qa.get('department', '未知科室'),
+                        "title": qa.get('title', ''),
+                        "ask": qa.get('ask', ''),
+                        "answer": qa.get('answer', ''),
                         "node_type": "MedicalQA",
-                        "doc_type": "qa_pair",
-                        "content_length": len(content)
+                        "doc_type": "chunk",
+                        "chunk_id": f"{node_id}_full",
+                        "parent_id": node_id,
+                        "chunk_index": 0,
+                        "total_chunks": 1,
+                        "chunk_size": len(content),
+                        "content_length": len(content),
                     }
                 )
-                documents.append(doc)
-
+                chunks.append(chunk)
             except Exception as e:
-                logger.warning(f"构建医学文档失败: {e}")
+                logger.warning(f"构建文档块失败: {e}")
                 continue
 
-        self.documents = documents
-        logger.info(f"成功构建 {len(documents)} 个医学问答文档")
-        return documents
-
-    def chunk_documents(self, chunk_size: int = 500, chunk_overlap: int = 50) -> List[Document]:
-        """
-        对于医学问答对，我们不再进行物理切分，只进行格式封装
-        保持 1条QA = 1个完整Chunk 的对应关系
-        """
-        logger.info("正在封装医学问答块（不执行物理截断）...")
-
-        if not self.documents:
-            raise ValueError("请先构建文档")
-
-        chunks = []
-
-        for doc in self.documents:
-            content = doc.page_content
-            node_id = doc.metadata["node_id"]
-
-            # 直接将原文档作为一个完整块返回
-            chunk = Document(
-                page_content=content,
-                metadata={
-                    **doc.metadata,
-                    "chunk_id": f"{node_id}_full",
-                    "parent_id": node_id,
-                    "chunk_index": 0,
-                    "total_chunks": 1,
-                    "chunk_size": len(content),
-                    "doc_type": "chunk"
-                }
-            )
-            chunks.append(chunk)
-
+        self.documents = chunks
         self.chunks = chunks
-        logger.info(f"问答块封装完成，共 {len(chunks)} 条完整数据")
+        logger.info(f"问答块构建完成，共 {len(chunks)} 条完整数据")
         return chunks
 
     def get_statistics(self) -> Dict[str, Any]:

@@ -3,7 +3,6 @@
 """
 
 import logging
-import time
 from typing import List, Dict, Any, Optional
 
 from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema
@@ -275,9 +274,9 @@ class MilvusIndexConstructionModule:
             self.client.load_collection(self.collection_name)
             logger.info("集合已加载到内存")
 
-            # 5. 等待索引构建完成
+            # 5. 等待索引构建完成（轮询替代硬编码 sleep）
             logger.info("等待索引构建完成...")
-            time.sleep(2)
+            self._wait_for_index()
 
             logger.info(f"✅ 向量索引构建完成，总计包含 {total_chunks} 个向量")
             return True
@@ -480,16 +479,42 @@ class MilvusIndexConstructionModule:
             if not self.client.has_collection(self.collection_name):
                 logger.error(f"集合 {self.collection_name} 不存在")
                 return False
-            
+
             self.client.load_collection(self.collection_name)
             self.collection_created = True
             logger.info(f"集合 {self.collection_name} 已加载到内存")
             return True
-            
+
         except Exception as e:
             logger.error(f"加载集合失败: {e}")
             return False
-    
+
+    def _wait_for_index(self, timeout: int = 120):
+        """轮询等待索引构建完成，替代硬编码 sleep"""
+        start = __import__('time').time()
+        while __import__('time').time() - start < timeout:
+            try:
+                stats = self.client.get_collection_stats(self.collection_name)
+                progress = stats.get("index_building_progress", 100)
+                if progress >= 100:
+                    logger.info(f"索引构建完成 (进度: {progress}%)")
+                    return
+                logger.info(f"索引构建中... 进度: {progress}%")
+            except Exception:
+                pass
+            __import__('time').sleep(3)
+        logger.warning("等待索引构建超时，继续执行")
+
+    def get_row_count(self) -> int:
+        """获取集合中的记录数，用于增量同步检测"""
+        try:
+            if not self.collection_created:
+                return 0
+            stats = self.client.get_collection_stats(self.collection_name)
+            return stats.get("row_count", 0)
+        except Exception:
+            return 0
+
     def close(self):
         """关闭连接"""
         if hasattr(self, 'client') and self.client:
