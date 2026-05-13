@@ -34,7 +34,6 @@ ENV/
 .env
 .env.local
 .env.example
-config.env
 
 # Logs
 *.log
@@ -52,34 +51,23 @@ logs/
 ehthumbs.db
 Thumbs.db
 
-# python环境相关目录
-rag/
+# Docker volumes (Milvus/MinIO/etcd runtime data)
+volumes/
 
-# Model files
-*.h5
-*.pt
-*.pth
-*.ckpt
-*.pkl
-*.faiss
-
-# Volume data (Milvus, MinIO, etcd)
-code/**/volumes/
-code/C10/volumes/
+# Neo4j runtime data
+data/neo4j/
 
 # Model binary files
-code/**/pytorch_model.bin
-code/**/model.onnx
-code/**/model.onnx_data
-code/**/sentencepiece.bpe.model
-code/**/Constant_7_attr__value
+models/**/pytorch_model.bin
+models/**/model.onnx
+models/**/model.onnx_data
+models/**/sentencepiece.bpe.model
+models/**/Constant_7_attr__value
 
 # Cache
 .cache/
 .cache/modelscope/
 .cargo
-
-# Models
 
 # LLM API keys
 *.key

@@ -446,9 +446,9 @@ class ConversationMemory:
                     """
                     MATCH (ses:Session {session_id: $sid})-[:CONTAINS]->(t:Turn)
                     OPTIONAL MATCH (t)-[:REFERENCES_DISEASE]->(d:Disease)
+                    WITH t, collect(DISTINCT d.name) AS diseases
                     RETURN t.question AS question, t.answer AS answer,
-                           t.strategy AS strategy,
-                           collect(DISTINCT d.name) AS diseases
+                           t.strategy AS strategy, diseases
                     ORDER BY t.turn_index
                     """,
                     sid=session_id,

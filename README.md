@@ -1,208 +1,244 @@
-# Agentic-RAG：基于图谱增强检索的临床辅助问答系统
+# Agentic-RAG：图谱增强检索临床辅助决策系统
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![Neo4j](https://img.shields.io/badge/Neo4j-5.x-green)
+![Python](https://img.shields.io/badge/Python-3.11+-blue)
+![Neo4j](https://img.shields.io/badge/Neo4j-5.18-green)
 ![Milvus](https://img.shields.io/badge/Milvus-2.5-00A1EA)
-![DeepSeek](https://img.shields.io/badge/LLM-DeepSeek--Chat-red)
+![DeepSeek](https://img.shields.io/badge/LLM-DeepSeek-red)
 
 ## 项目简介
 
-**Agentic-RAG** 是一个面向医疗场景的 **图谱增强检索生成（GraphRAG）** 系统。它融合了**向量检索**与**知识图谱推理**两种范式，能够对临床问答数据进行智能检索与答案生成，为医生和患者提供辅助决策支持。
+Agentic-RAG 是面向临床场景的**图谱增强检索生成（GraphRAG）**系统。融合**向量语义检索**、**知识图谱推理**和**对话记忆**三种能力，对历史临床问答数据进行智能检索与答案生成，为医生提供辅助决策支持。
 
-核心思路：将历史临床 QA 数据同时构建为向量索引和 Neo4j 知识图谱，通过智能路由引擎动态选择最佳检索策略（混合检索、图谱推理或二者融合），最终由大语言模型生成专业、可追溯的医学回答。
+核心思路：将历史 QA 数据同时构建为向量索引和 Neo4j 知识图谱，通过 LLM 驱动的智能路由动态选择最佳检索策略，结合对话记忆追踪诊断推理链，最终生成可追溯的医学回答。
 
 ## 系统架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    用户界面 (Streamlit / CLI)              │
-└────────────────────────┬────────────────────────────────┘
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│               IntelligentQueryRouter                     │
-│          (LLM 驱动查询路由 → 策略选择)                    │
-└──────┬────────────────────────────┬─────────────────────┘
-       ▼                            ▼
-┌──────────────┐          ┌──────────────────┐
-│ HybridRetrieval│         │  GraphRAGRetrieval│
-│ (向量 + BM25)  │         │  (多跳 / 子图 /    │
-│               │         │   路径推理)         │
-└──────┬───────┘          └──────┬───────────┘
-       │                         │
-       ▼                         ▼
-┌──────────────┐          ┌──────────────────┐
-│   Milvus     │          │      Neo4j        │
-│ (向量数据库)   │          │  (知识图谱)        │
-└──────────────┘          └──────────────────┘
-       ▲                         ▲
-       └──────────┬──────────────┘
-                  ▼
-┌─────────────────────────────────────────────────────────┐
-│               GenerationIntegrationModule                │
-│          (DeepSeek 答案生成 + 医疗免责声明)               │
-└─────────────────────────────────────────────────────────┘
+                    ┌──────────────────────────┐
+                    │   用户界面 (CLI / Streamlit)   │
+                    └─────────────┬────────────┘
+                                  ▼
+                    ┌──────────────────────────┐
+                    │   ConversationMemory      │  ← 对话记忆（缓冲 + 图谱 + 向量）
+                    └─────────────┬────────────┘
+                                  ▼
+                    ┌──────────────────────────┐
+                    │  IntelligentQueryRouter   │  ← LLM 分析复杂度 → 选择策略
+                    └──────┬────────┬──────────┘
+                           │        │
+              ┌────────────┘        └────────────┐
+              ▼                                  ▼
+   ┌──────────────────┐              ┌──────────────────┐
+   │ HybridRetrieval   │              │ GraphRAGRetrieval │
+   │ 向量 + BM25 + 图   │              │ 多跳 / 子图 / 路径  │
+   └───────┬──────────┘              └───────┬──────────┘
+           │                                  │
+     ┌─────┴─────┐                      ┌─────┴─────┐
+     ▼           ▼                      ▼           ▼
+   Milvus      Neo4j                  Neo4j       Neo4j
+  (向量库)    (图数据库)               (图数据库)    (图数据库)
+           │                                  │
+           └──────────────┬───────────────────┘
+                          ▼
+            ┌──────────────────────────┐
+            │ GenerationIntegration     │  ← DeepSeek 生成 + 医疗免责声明
+            │ (记忆上下文 + 检索结果)     │
+            └──────────────────────────┘
 ```
-
-### 数据处理流程
-
-1. **CSV 导入** → 读取各科室历史 QA 数据
-2. **疾病实体识别** → 基于疾病词典匹配提取疾病关键词
-3. **Neo4j 图谱构建** → 创建 `科室 → 咨询 → 疾病` 关系网络
-4. **向量索引构建** → 使用 BGE 模型编码文档，写入 Milvus
-5. **检索 & 生成** → 路由 → 检索 → 融合 → DeepSeek 生成答案
 
 ## 功能特性
 
-- **双通道检索**：结合向量语义检索（Milvus + BGE）与传统关键词检索（BM25）
-- **图谱推理**：支持多跳实体关系查询、子图提取、最短路径发现
-- **智能路由**：LLM 动态分析查询复杂度，自动选择混合检索 / 图谱检索 / 融合策略
-- **增量扩展**：支持持续添加新问答数据，实时更新图谱与向量索引
-- **医疗专属提示词**：内置患者隐私隔离、可追溯引用、专业声明机制
-- **流式输出**：支持 DeepSeek API 流式生成，实时展示思考过程
-- **交互界面**：提供 Streamlit Web UI 和 Python CLI 两种交互方式
+### 检索与推理
+- **三通道检索**：向量语义（Milvus + BGE） + 关键词（BM25） + 图谱推理（Neo4j Cypher）
+- **智能路由**：LLM 分析查询复杂度与关系密度，自动选择混合检索 / 图谱推理 / 融合策略
+- **多跳推理**：支持疾病 → 症状 → 药物 → 禁忌的深度图遍历
+
+### 对话记忆（NEW）
+- **三层混合记忆**：短期缓冲（deque） + 图谱记忆（Neo4j Session/Turn） + 语义记忆（Milvus）
+- **诊断链追踪**：会话中讨论的疾病、策略、推理路径持久化为图结构，可审计可回溯
+- **跨会话召回**：语义相似病例跨会话检索，回答"之前见过类似病例吗？"
+- **指代消解**：理解"刚才提到的那个药"、"之前的诊断"等上下文指代
+
+### 数据与工程
+- **增量更新**：支持运行时导入新 CSV，追加到图谱和向量索引
+- **智能同步检测**：启动时对比 Neo4j + Milvus 元数据，跳过已同步数据的重复构建
+- **编译正则疾病匹配**：1000+ 疾病词典 O(N) 单次扫描，替代 O(N×D) 暴力循环
+- **索引构建轮询**：替代硬编码 sleep，轮询 Milvus 索引进度直到完成
+- **流式输出**：DeepSeek API 流式生成，实时展示推理过程
+- **双界面**：Streamlit Web UI + Python CLI
 
 ## 技术栈
 
-| 类别        | 技术选型                                                     |
-| ----------- | ------------------------------------------------------------ |
-| 大语言模型  | DeepSeek Chat（OpenAI 兼容接口）                             |
-| 向量数据库  | Milvus 2.5（HNSW 索引，Cosine 相似度）                      |
-| 图数据库    | Neo4j 5.x                                                    |
-| 嵌入模型    | BAAI/bge-base-zh-v1.5（768维）、BAAI/bge-m3                  |
-| 框架工具    | LangChain（BM25Retriever）、HuggingFace Transformers         |
-| 前端界面    | Streamlit                                                     |
-| 基础设施    | Docker Compose（Milvus 全家桶：etcd + MinIO + standalone）    |
+| 类别       | 技术                                                     |
+| ---------- | -------------------------------------------------------- |
+| 大语言模型 | DeepSeek Chat（OpenAI 兼容 API）                         |
+| 向量数据库 | Milvus 2.5（HNSW 索引，Cosine 相似度）                   |
+| 图数据库   | Neo4j 5.18（APOC 插件）                                   |
+| 嵌入模型   | BAAI/bge-base-zh-v1.5（768 维）                          |
+| 框架       | LangChain, HuggingFace Transformers, Sentence-Transformers |
+| 前端       | Streamlit                                                |
+| 基础设施   | Docker Compose（etcd + MinIO + Milvus + Neo4j）          |
 
 ## 快速开始
 
 ### 环境要求
 
-- Python 3.10+
-- Docker & Docker Compose（用于 Milvus 和 Neo4j）
-- CUDA（可选，用于 GPU 加速嵌入）
+- Python 3.11+
+- Docker & Docker Compose
+- CUDA（可选，GPU 加速嵌入）
 
-### 1. 克隆项目
+### 1. 克隆与配置
 
 ```bash
 git clone <repo-url>
 cd Agentic-RAG
 ```
 
-### 2. 配置环境变量
-
-创建 `config.env` 文件（或重命名已有模板）：
-
+编辑 `.env`，填入 DeepSeek API key：
 ```env
-DEEPSEEK_API_KEY=your_deepseek_api_key
-DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+DEEPSEEK_API_KEY=sk-your-key-here
 ```
 
-### 3. 启动基础设施
+### 2. 启动服务
 
 ```bash
-# 启动 Milvus（向量数据库）
-docker compose -f code/docker-compose.yml up -d
-
-# 启动 Neo4j（图数据库）
-docker compose -f data/C10/docker-compose.yml up -d
+docker compose up -d
 ```
 
-### 4. 安装依赖
+服务端口：Milvus `19530`，Neo4j Bolt `8687`，Neo4j HTTP `8474`
+
+### 3. 安装依赖
 
 ```bash
-pip install -r code/requirements.txt
+conda activate all-in-rag   # 或创建新环境
+pip install -r requirements.txt
 ```
 
-### 5. 下载嵌入模型
+### 4. 下载嵌入模型（可选，已内置）
 
 ```bash
-python code/m3_download.py
+python scripts/download_model.py
 ```
 
-### 6. 运行系统
+### 5. 运行
 
 **CLI 交互模式：**
 ```bash
-python code/C10/main.py
+python app/main.py
 ```
+
+交互命令：
+| 命令 | 说明 |
+|------|------|
+| `<直接输入问题>` | 发送临床咨询 |
+| `stats` | 查看知识库与记忆模块统计 |
+| `rebuild` | 重建知识图谱与向量库 |
+| `add <路径>` | 增量导入 CSV 数据 |
+| `quit` | 安全退出（自动持久化记忆） |
 
 **Web UI 模式：**
 ```bash
-streamlit run code/C10/web_app.py
+streamlit run app/web_app.py
 ```
 
 ## 项目结构
 
 ```
 Agentic-RAG/
-├── config.env                     # 环境变量配置
-├── CSV_DATA/                      # 临床 QA 原始数据
-│   ├── Andriatria_男科/
-│   ├── IM_内科/
-│   ├── OAGD_妇产科/
-│   ├── Oncology_肿瘤科/
-│   ├── Pediatric_儿科/
-│   └── Surgical_外科/
+├── .env                  # API key 等环境变量
+├── .env.example          # 环境变量模板
+├── requirements.txt      # Python 依赖
+├── docker-compose.yml    # 全部服务编排
+│
+├── app/                  # 主应用
+│   ├── main.py           # 系统入口 & 协调器
+│   ├── web_app.py        # Streamlit Web UI
+│   ├── config.py         # 全局配置 (GraphRAGConfig)
+│   ├── clean_milvus.py   # 清理 Milvus 集合
+│   └── rag_modules/
+│       ├── graph_data_preparation.py      # CSV 导入 & Neo4j 图谱构建
+│       ├── milvus_index_construction.py   # Milvus 向量索引构建
+│       ├── graph_indexing.py              # 内存图索引 (KV 存储)
+│       ├── hybrid_retrieval.py            # 混合检索 (向量+BM25+图)
+│       ├── graph_rag_retrieval.py         # 图谱检索 (多跳/子图/路径)
+│       ├── intelligent_query_router.py    # LLM 查询路由引擎
+│       ├── generation_integration.py      # DeepSeek 答案生成
+│       └── conversation_memory.py         # 对话记忆模块 (三层混合)
+│
+├── models/               # 本地嵌入模型
+│   ├── bge-base-zh-v1.5/
+│   └── bge-m3/
+│
 ├── data/
-│   └── C10/                       # Neo4j 数据 & 疾病词典
-│       ├── docker-compose.yml
-│       ├── disease_dict.xlsx      # 疾病词典
-│       └── 典型病历.xlsx           # 示例病历数据
-├── code/
-│   ├── requirements.txt           # Python 依赖
-│   ├── docker-compose.yml         # Milvus 容器编排
-│   ├── m3_download.py             # 嵌入模型下载脚本
-│   ├── models/                    # 本地嵌入模型权重
-│   └── C10/
-│       ├── main.py                # 系统入口 & 协调器
-│       ├── web_app.py             # Streamlit 交互界面
-│       ├── config.py              # 全局配置（数据类）
-│       ├── clean_milvus.py        # 清理 Milvus 集合工具
-│       └── rag_modules/
-│           ├── graph_data_preparation.py   # CSV 导入 & 图谱构建
-│           ├── milvus_index_construction.py # 向量索引构建
-│           ├── graph_indexing.py           # 内存图索引（KV 存储）
-│           ├── hybrid_retrieval.py          # 混合检索（向量 + BM25）
-│           ├── graph_rag_retrieval.py       # 图谱检索（多跳/子图/路径）
-│           ├── intelligent_query_router.py  # LLM 查询路由引擎
-│           └── generation_integration.py    # DeepSeek 答案生成
-└── README.md
+│   ├── raw/              # 原始 CSV 数据 (6 科室 ~86k QA)
+│   ├── processed/         # 处理后数据
+│   ├── disease_dict.txt   # 疾病词典 (~1000 条目)
+│   ├── test_20.csv        # 测试数据
+│   ├── images/            # 医学流程图
+│   └── neo4j/             # Neo4j 持久化 (gitignored)
+│
+├── scripts/              # 工具脚本
+│   ├── download_model.py
+│   ├── convert_csv_encoding.py
+│   └── clean_neo4j.py
+│
+└── volumes/              # Docker 运行时数据 (gitignored)
 ```
 
-## 核心模块说明
+## 模块详解
 
-### GraphDataPreparationModule
-从 CSV 加载各科室 QA 数据，利用疾病词典进行实体匹配，构建 Neo4j 知识图谱（Department → Consultation → Disease），并生成 LangChain Document 对象供向量索引使用。
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| 数据准备 | `graph_data_preparation.py` | CSV 递归加载，编译正则在 O(N) 时间内匹配疾病实体，批量构建 Neo4j 图谱（Department→Consultation→Disease），合并 doc+chunk 单次遍历生成向量文本 |
+| 向量索引 | `milvus_index_construction.py` | BGE 模型嵌入编码，Milvus Collection 管理，HNSW 索引，分批防 OOM 插入，轮询等待索引就绪 |
+| 图索引 | `graph_indexing.py` | 内存 KV 存储实体/关系，关键词查找，邻居扩展，去重 |
+| 混合检索 | `hybrid_retrieval.py` | 双层检索（实体级+主题级），LLM 提取关键词，BM25 + Milvus 向量 + Neo4j 补充，Round-robin 融合 |
+| 图谱检索 | `graph_rag_retrieval.py` | 查询意图理解（entity_relation/multi_hop/subgraph/path_finding/clustering），Cypher 多跳遍历，子图提取，图结构推理链 |
+| 查询路由 | `intelligent_query_router.py` | LLM 分析复杂度+关系密度，路由到 hybrid/graph/combined 策略，失败降级规则匹配 |
+| 答案生成 | `generation_integration.py` | 记忆上下文+检索结果融合 prompt，流式/非流式生成，网络重试，强制医疗免责声明 |
+| **对话记忆** | `conversation_memory.py` | 短期缓冲（deque）+ 图谱记忆（Neo4j Session/Turn 节点）+ 语义记忆（Milvus 新集合），三层检索融合 |
 
-### MilvusIndexConstructionModule
-使用 BGE 系列模型对文档进行嵌入编码，管理 Milvus Collection 的创建、索引构建（HNSW）和插入操作，支持按科室过滤。
+## 记忆模块数据模型
 
-### HybridRetrievalModule
-双层检索：实体级关键词匹配 + 主题级关系匹配（基于内存图索引），结合 BM25 与 Milvus 向量检索，通过轮巡策略融合结果。
-
-### GraphRAGRetrieval
-纯图谱检索模块，理解查询意图（实体关系、多跳推理、子图提取、路径发现），执行 Cypher 查询进行多跳遍历，构建推理链上下文。
-
-### IntelligentQueryRouter
-核心路由引擎——使用 DeepSeek 分析查询的复杂度和关系密度，决定使用混合检索、GraphRAG 还是融合策略，失败时降级为规则判断。
-
-### GenerationIntegrationModule
-构建医疗专用提示词，融合检索结果后调用 DeepSeek API 生成答案，支持流式输出、引用溯源与医疗免责声明。
+```
+(Session {session_id, start_time, turn_count, patient_summary})
+    └─[:CONTAINS]→ (Turn {turn_id, question, answer, strategy, complexity_score})
+        ├─[:REFERENCES_DISEASE]→ (Disease)   ← 复用已有疾病节点
+        ├─[:REFERENCES_DEPT]→ (Department)   ← 复用已有科室节点
+        └─[:NEXT]→ (Turn)                    ← 链式推理时序
+```
 
 ## 配置说明
 
-主要配置集中在 `code/C10/config.py`：
+全部配置在 `app/config.py` 的 `GraphRAGConfig` 数据类中：
 
-| 参数             | 说明                               | 默认值                        |
-| ---------------- | ---------------------------------- | ----------------------------- |
-| `NEO4J_URI`      | Neo4j 连接地址                     | `bolt://localhost:7687`       |
-| `NEO4J_USER`     | Neo4j 用户名                       | `neo4j`                       |
-| `NEO4J_PASSWORD` | Neo4j 密码                         | `password`                    |
-| `MILVUS_HOST`    | Milvus 服务地址                    | `localhost`                   |
-| `MILVUS_PORT`    | Milvus 端口                        | `19530`                       |
-| `EMBEDDING_MODEL`| 嵌入模型路径或名称                 | `bge-base-zh-v1.5`            |
-| `TOP_K`          | 检索返回 Top-K 文档数              | `5`                           |
-| `ROUTER_MODEL`   | 路由 / 生成使用的 LLM 模型名称     | `deepseek-chat`               |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `neo4j_uri` | `bolt://localhost:8687` | Neo4j 连接 |
+| `milvus_host` / `milvus_port` | `localhost:19530` | Milvus 连接 |
+| `embedding_model` | `<auto>/models/bge-base-zh-v1.5` | 嵌入模型路径 |
+| `llm_model` | `deepseek-chat` | 生成模型 |
+| `top_k` | `5` | 检索返回数 |
+| `temperature` | `0.1` | 生成温度 |
+| `memory_enabled` | `True` | 启用记忆模块 |
+| `memory_buffer_size` | `10` | 短期缓冲轮数 |
+| `memory_top_k` | `3` | 语义记忆召回数 |
+| `memory_summary_threshold` | `10` | 触发 LLM 摘要轮数 |
+
+## 数据处理流程
+
+```
+CSV 加载 (data/processed/)
+  │
+  ├─→ 疾病识别 (编译正则单次扫描, O(N))
+  │     └─→ Neo4j 图谱构建 (UNWIND 批量写入, batch=2000)
+  │           └─→ SystemMeta 元数据标记
+  │
+  └─→ 文档块构建 (doc+chunk 合并单次遍历)
+        └─→ Milvus 向量索引 (batch=500, 轮询索引就绪)
+              └─→ 检索引擎初始化 (内存图索引预热)
+                    └─→ 记忆模块初始化 (Neo4j 约束 + Milvus 新集合)
+```
 
 ## License
 

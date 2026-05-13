@@ -60,7 +60,7 @@ def batch_convert_gbk_to_utf8(root_dir):
 
 if __name__ == "__main__":
     # 你的目标文件夹路径
-    target_directory = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "C10", "Data_CSV")
+    target_directory = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "processed")
 
     # 建议在执行批量覆盖操作前，先在资源管理器里把 Data_CSV 文件夹复制备份一份！
     batch_convert_gbk_to_utf8(target_directory)
