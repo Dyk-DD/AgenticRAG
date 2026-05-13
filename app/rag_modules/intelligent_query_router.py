@@ -206,6 +206,9 @@ class IntelligentQueryRouter:
             # 4. 结果后处理
             documents = self._post_process_results(documents, analysis)
 
+            # Cache for traceability
+            self.last_retrieved_docs = documents
+
             logger.info(f"路由完成，返回 {len(documents)} 份医学参考资料")
             return documents, analysis
 
@@ -213,6 +216,7 @@ class IntelligentQueryRouter:
             logger.error(f"临床查询路由失败: {e}")
             # 降级到传统检索
             documents = self.traditional_retrieval.hybrid_search(query, top_k)
+            self.last_retrieved_docs = documents
             return documents, analysis
 
     def _combined_search(self, query: str, top_k: int) -> List[Document]:

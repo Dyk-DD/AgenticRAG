@@ -69,6 +69,24 @@ def get_qa_db() -> QADatabase:
     return _qa_db
 
 
+def build_retrieved_docs_json(documents) -> str:
+    """Extract source metadata from retrieved documents for traceability."""
+    entries = []
+    for i, doc in enumerate(documents):
+        meta = doc.metadata
+        entries.append({
+            "index": i,
+            "chunk_id": meta.get("chunk_id", ""),
+            "node_id": meta.get("node_id", ""),
+            "title": meta.get("title", ""),
+            "department": meta.get("department", ""),
+            "search_source": meta.get("search_source", meta.get("search_method", "")),
+            "route_strategy": meta.get("route_strategy", ""),
+            "relevance_score": meta.get("final_score", meta.get("relevance_score", 0)),
+        })
+    return json.dumps(entries, ensure_ascii=False)
+
+
 # ── Request/Response models ──────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -92,6 +110,7 @@ def chat(req: ChatRequest) -> ChatResponse:
     try:
         result, analysis = rag.ask_question_with_routing(req.question, stream=False)
         routing = None
+        retrieved_json = "[]"
         if analysis:
             routing = {
                 "strategy": analysis.recommended_strategy.value,
@@ -99,6 +118,13 @@ def chat(req: ChatRequest) -> ChatResponse:
                 "intensity": analysis.relationship_intensity,
                 "reasoning": analysis.reasoning,
             }
+            # Log and capture retrieved document sources
+            router = getattr(rag, 'router', None)
+            if router:
+                docs = router.last_retrieved_docs if hasattr(router, 'last_retrieved_docs') else []
+                if docs:
+                    retrieved_json = build_retrieved_docs_json(docs)
+                    logger.info(f"[检索来源] 共 {len(docs)} 条:\n{retrieved_json}")
 
         # Persist to SQLite
         if rag.current_session_id:
@@ -110,6 +136,7 @@ def chat(req: ChatRequest) -> ChatResponse:
                 strategy=analysis.recommended_strategy.value if analysis else "unknown",
                 complexity=analysis.query_complexity if analysis else 0.0,
                 routing_reasoning=analysis.reasoning if analysis else "",
+                retrieved_docs=retrieved_json,
             )
 
         return ChatResponse(
@@ -186,6 +213,10 @@ async def chat_stream(req: ChatRequest):
                 complexity_val = analysis.query_complexity if analysis else 0.0
                 reasoning_val = analysis.reasoning if analysis else ""
 
+                # Build retrieved docs JSON and log
+                retrieved_json = build_retrieved_docs_json(relevant_docs)
+                logger.info(f"[检索来源] 共 {len(relevant_docs)} 条:\n{retrieved_json}")
+
                 try:
                     db.record_qa(
                         session_id=sid,
@@ -194,6 +225,7 @@ async def chat_stream(req: ChatRequest):
                         strategy=strategy_val,
                         complexity=complexity_val,
                         routing_reasoning=reasoning_val,
+                        retrieved_docs=retrieved_json,
                     )
                 except Exception:
                     logger.warning("Failed to persist to SQLite", exc_info=True)
