@@ -26,6 +26,14 @@ class QADatabase:
     def _init_schema(self):
         with self._connect() as conn:
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS patients (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    access_code TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
                     client_id TEXT NOT NULL DEFAULT '',
@@ -61,6 +69,38 @@ class QADatabase:
                     conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT DEFAULT ''")
                 except sqlite3.OperationalError:
                     pass
+
+    # ── Patient management ──────────────────────────────────────────
+
+    def register_patient(self, name: str, access_code: str = "") -> dict:
+        import hashlib
+        pid = "p_" + hashlib.md5(f"{name}{time.time()}".encode()).hexdigest()[:8]
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO patients (id, name, access_code, created_at) VALUES (?, ?, ?, ?)",
+                (pid, name, access_code, time.strftime("%Y-%m-%dT%H:%M:%S")),
+            )
+        logger.info(f"Patient registered: {pid} ({name})")
+        return {"patient_id": pid, "name": name}
+
+    def list_patients(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, created_at FROM patients ORDER BY created_at DESC LIMIT 50"
+            ).fetchall()
+        return [{"patient_id": r["id"], "name": r["name"], "created_at": r["created_at"]} for r in rows]
+
+    def verify_patient(self, patient_id: str, access_code: str = "") -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, name FROM patients WHERE id = ? AND access_code = ?",
+                (patient_id, access_code),
+            ).fetchone()
+        if row:
+            return {"patient_id": row["id"], "name": row["name"]}
+        return None
+
+    # ── Session management ──────────────────────────────────────────
 
     def create_session(self, session_id: str, client_id: str = ""):
         with self._connect() as conn:

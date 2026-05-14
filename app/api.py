@@ -108,8 +108,39 @@ def get_qa_db() -> QADatabase:
 
 from fastapi import Request as FastAPIRequest
 
-def _get_client(req: FastAPIRequest) -> str:
-    return req.headers.get("x-client-id", "")
+def _get_patient(req: FastAPIRequest) -> str:
+    """Extract patient_id from request header."""
+    return req.headers.get("x-patient-id", "")
+
+# ── Patient endpoints ─────────────────────────────────────────────────
+
+class PatientRegister(BaseModel):
+    name: str
+    access_code: str = ""
+
+class PatientLogin(BaseModel):
+    patient_id: str
+    access_code: str = ""
+
+@app.post("/api/patients/register")
+def register_patient(body: PatientRegister):
+    db = get_qa_db()
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="姓名不能为空")
+    return db.register_patient(body.name.strip(), body.access_code.strip())
+
+@app.get("/api/patients")
+def list_patients():
+    db = get_qa_db()
+    return {"patients": db.list_patients()}
+
+@app.post("/api/patients/login")
+def login_patient(body: PatientLogin):
+    db = get_qa_db()
+    patient = db.verify_patient(body.patient_id, body.access_code)
+    if not patient:
+        raise HTTPException(status_code=403, detail="患者ID或访问码错误")
+    return patient
 
 
 def build_retrieved_docs_json(documents) -> str:
@@ -150,7 +181,7 @@ class ChatResponse(BaseModel):
 def chat(req: ChatRequest, request: FastAPIRequest) -> ChatResponse:
     rag = get_rag()
     db = get_qa_db()
-    cid = _get_client(request)
+    cid = _get_patient(request)
     try:
         result, analysis = rag.ask_question_with_routing(req.question, stream=False)
         routing = None
@@ -201,7 +232,7 @@ def chat(req: ChatRequest, request: FastAPIRequest) -> ChatResponse:
 async def chat_stream(req: ChatRequest, request: FastAPIRequest):
     rag = get_rag()
     db = get_qa_db()
-    cid = _get_client(request)
+    cid = _get_patient(request)
 
     async def event_stream():
         try:
@@ -314,14 +345,14 @@ async def chat_stream(req: ChatRequest, request: FastAPIRequest):
 
 @app.get("/api/sessions")
 def list_sessions(request: FastAPIRequest):
-    cid = _get_client(request)
+    cid = _get_patient(request)
     db = get_qa_db()
     return {"sessions": db.list_sessions(client_id=cid)}
 
 
 @app.get("/api/sessions/{session_id}")
 def get_session_detail(session_id: str, request: FastAPIRequest):
-    cid = _get_client(request)
+    cid = _get_patient(request)
     db = get_qa_db()
     detail = db.get_session_detail(session_id, client_id=cid)
     if detail is None:
@@ -331,7 +362,7 @@ def get_session_detail(session_id: str, request: FastAPIRequest):
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, request: FastAPIRequest):
-    cid = _get_client(request)
+    cid = _get_patient(request)
     rag = get_rag()
     db = get_qa_db()
 
@@ -360,7 +391,7 @@ def delete_session(session_id: str, request: FastAPIRequest):
 
 @app.post("/api/sessions")
 def create_session(request: FastAPIRequest):
-    cid = _get_client(request)
+    cid = _get_patient(request)
     rag = get_rag()
     db = get_qa_db()
 
