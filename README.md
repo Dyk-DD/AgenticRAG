@@ -76,7 +76,8 @@ Agentic-RAG 是面向临床场景的**图谱增强检索生成（GraphRAG）**�
 | 图数据库   | Neo4j 5.18（APOC 插件）                                   |
 | 嵌入模型   | BAAI/bge-base-zh-v1.5（768 维）                          |
 | 框架       | LangChain, HuggingFace Transformers, Sentence-Transformers |
-| 前端       | Streamlit                                                |
+| API 层     | FastAPI + SSE 流式                                       |
+| 前端       | React 19 + TypeScript + Vite（GitHub Pages 部署）         |
 | 基础设施   | Docker Compose（etcd + MinIO + Milvus + Neo4j）          |
 
 ## 快速开始
@@ -136,10 +137,51 @@ python app/main.py
 | `add <路径>` | 增量导入 CSV 数据 |
 | `quit` | 安全退出（自动持久化记忆） |
 
-**Web UI 模式：**
+**Web UI 模式（FastAPI + React）：**
 ```bash
-streamlit run app/web_app.py
+uvicorn app.api:app --host 0.0.0.0 --port 8000
 ```
+
+前端开发模式（带热更新，API 自动代理到 8000）：
+```bash
+cd frontend && npm run dev
+```
+
+## 公网展示：GitHub Pages + 本地后端
+
+前端部署在 GitHub Pages，后端在本地运行，通过 HTTPS 隧道打通。
+
+```
+浏览器 (https://dyk-dd.github.io) ──HTTPS──▶ ngrok 隧道 ──HTTP──▶ localhost:8000
+```
+
+### 操作步骤
+
+1. **启动基础设施**
+
+```bash
+docker compose up -d   # Milvus + Neo4j
+```
+
+1. **启动后端**
+
+```bash
+uvicorn app.api:app --host 0.0.0.0 --port 8000
+```
+
+1. **启动 ngrok 隧道**
+
+```bash
+ngrok http 8000
+```
+
+ngrok 会输出一个公网 HTTPS 地址，格式为 `https://xxxx.ngrok-free.app`。
+
+1. **打开前端，配置后端地址**
+
+访问 `https://dyk-dd.github.io`，点击左侧边栏底部的 ⚙ 后端连接，粘贴 ngrok 提供的 HTTPS 地址，点击测试后保存即可。
+
+> 每次重启 ngrok 会生成新地址（免费版），重新粘贴即可。付费版可使用固定域名。
 
 ## 项目结构
 

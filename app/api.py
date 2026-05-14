@@ -14,9 +14,9 @@ from typing import Optional
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from main import ClinicalDecisionSystem
@@ -24,6 +24,8 @@ from qa_database import QADatabase
 
 load_dotenv(override=True)
 logger = logging.getLogger(__name__)
+
+ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "")
 
 app = FastAPI(title="Agentic-RAG API", version="1.0")
 
@@ -38,6 +40,41 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Auth middleware ───────────────────────────────────────────────────
+
+PUBLIC_PATHS = {"/api/health", "/api/auth"}
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    # Skip auth for public paths and OPTIONS (CORS preflight)
+    if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    if not ACCESS_PASSWORD:
+        # No password configured → allow all (backward compatible)
+        return await call_next(request)
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(status_code=401, content={"detail": "未提供访问令牌"})
+
+    token = auth_header[7:]
+    if token != ACCESS_PASSWORD:
+        return JSONResponse(status_code=403, content={"detail": "访问令牌无效"})
+
+    return await call_next(request)
+
+
+@app.post("/api/auth")
+async def auth_login(req: Request):
+    """Validate password and return token."""
+    body = await req.json()
+    password = body.get("password", "")
+    if not ACCESS_PASSWORD or password == ACCESS_PASSWORD:
+        return {"token": ACCESS_PASSWORD}
+    return JSONResponse(status_code=403, content={"detail": "密码错误"})
 
 _rag: Optional[ClinicalDecisionSystem] = None
 _qa_db: Optional[QADatabase] = None
