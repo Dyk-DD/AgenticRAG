@@ -106,6 +106,12 @@ def get_qa_db() -> QADatabase:
     return _qa_db
 
 
+from fastapi import Request as FastAPIRequest
+
+def _get_client(req: FastAPIRequest) -> str:
+    return req.headers.get("x-client-id", "")
+
+
 def build_retrieved_docs_json(documents) -> str:
     """Extract source metadata from retrieved documents for traceability."""
     entries = []
@@ -141,9 +147,10 @@ class ChatResponse(BaseModel):
 # ── Chat endpoints ───────────────────────────────────────────────────
 
 @app.post("/api/chat")
-def chat(req: ChatRequest) -> ChatResponse:
+def chat(req: ChatRequest, request: FastAPIRequest) -> ChatResponse:
     rag = get_rag()
     db = get_qa_db()
+    cid = _get_client(request)
     try:
         result, analysis = rag.ask_question_with_routing(req.question, stream=False)
         routing = None
@@ -155,7 +162,6 @@ def chat(req: ChatRequest) -> ChatResponse:
                 "intensity": analysis.relationship_intensity,
                 "reasoning": analysis.reasoning,
             }
-            # Log and capture retrieved document sources
             router = getattr(rag, 'router', None)
             if router:
                 docs = router.last_retrieved_docs if hasattr(router, 'last_retrieved_docs') else []
@@ -163,11 +169,12 @@ def chat(req: ChatRequest) -> ChatResponse:
                     retrieved_json = build_retrieved_docs_json(docs)
                     logger.info(f"[检索来源] 共 {len(docs)} 条:\n{retrieved_json}")
 
-        # Persist to SQLite
         if rag.current_session_id:
             sid = rag.current_session_id
+            db.ensure_session_client(sid, cid)
             db.record_qa(
                 session_id=sid,
+                client_id=cid,
                 question=req.question,
                 answer=str(result),
                 strategy=analysis.recommended_strategy.value if analysis else "unknown",
@@ -191,9 +198,10 @@ def chat(req: ChatRequest) -> ChatResponse:
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, request: FastAPIRequest):
     rag = get_rag()
     db = get_qa_db()
+    cid = _get_client(request)
 
     async def event_stream():
         try:
@@ -246,6 +254,7 @@ async def chat_stream(req: ChatRequest):
             # 5. Persist to SQLite
             if rag.current_session_id:
                 sid = rag.current_session_id
+                db.ensure_session_client(sid, cid)
                 strategy_val = analysis.recommended_strategy.value if analysis else "unknown"
                 complexity_val = analysis.query_complexity if analysis else 0.0
                 reasoning_val = analysis.reasoning if analysis else ""
@@ -257,6 +266,7 @@ async def chat_stream(req: ChatRequest):
                 try:
                     db.record_qa(
                         session_id=sid,
+                        client_id=cid,
                         question=req.question,
                         answer=full_answer,
                         strategy=strategy_val,
@@ -303,26 +313,29 @@ async def chat_stream(req: ChatRequest):
 # ── Session endpoints ─────────────────────────────────────────────────
 
 @app.get("/api/sessions")
-def list_sessions():
+def list_sessions(request: FastAPIRequest):
+    cid = _get_client(request)
     db = get_qa_db()
-    return {"sessions": db.list_sessions()}
+    return {"sessions": db.list_sessions(client_id=cid)}
 
 
 @app.get("/api/sessions/{session_id}")
-def get_session_detail(session_id: str):
+def get_session_detail(session_id: str, request: FastAPIRequest):
+    cid = _get_client(request)
     db = get_qa_db()
-    detail = db.get_session_detail(session_id)
+    detail = db.get_session_detail(session_id, client_id=cid)
     if detail is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     return detail
 
 
 @app.delete("/api/sessions/{session_id}")
-def delete_session(session_id: str):
+def delete_session(session_id: str, request: FastAPIRequest):
+    cid = _get_client(request)
     rag = get_rag()
     db = get_qa_db()
 
-    db.delete_session(session_id)
+    db.delete_session(session_id, client_id=cid)
 
     if rag.memory_module:
         try:
@@ -340,13 +353,14 @@ def delete_session(session_id: str):
 
     if rag.current_session_id == session_id:
         rag.current_session_id = rag.memory_module.create_session()
-        db.create_session(rag.current_session_id)
+        db.create_session(rag.current_session_id, client_id=cid)
 
     return {"status": "deleted", "session_id": session_id}
 
 
 @app.post("/api/sessions")
-def create_session():
+def create_session(request: FastAPIRequest):
+    cid = _get_client(request)
     rag = get_rag()
     db = get_qa_db()
 
@@ -354,7 +368,7 @@ def create_session():
         rag.memory_module.close_session(rag.current_session_id)
     if rag.memory_module:
         rag.current_session_id = rag.memory_module.create_session()
-        db.create_session(rag.current_session_id)
+        db.create_session(rag.current_session_id, client_id=cid)
 
     return {"session_id": rag.current_session_id}
 
