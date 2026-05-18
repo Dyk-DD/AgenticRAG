@@ -227,6 +227,7 @@ def chat(req: ChatRequest, request: FastAPIRequest) -> ChatResponse:
     rag = get_rag()
     db = get_qa_db()
     cid = _get_patient(request)
+    _ensure_session(rag, db, cid)
     try:
         result, analysis = rag.ask_question_with_routing(req.question, stream=False)
         routing = None
@@ -273,11 +274,24 @@ def chat(req: ChatRequest, request: FastAPIRequest) -> ChatResponse:
         )
 
 
+def _ensure_session(rag, db, cid: str) -> bool:
+    """确保当前有可用会话，没有则创建。返回 True 表示新创建的。"""
+    if rag.current_session_id is None:
+        if rag.memory_module:
+            rag.current_session_id = rag.memory_module.create_session()
+            db.create_session(rag.current_session_id, client_id=cid)
+            return True
+    return False
+
+
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest, request: FastAPIRequest):
     rag = get_rag()
     db = get_qa_db()
     cid = _get_patient(request)
+
+    # 确保有可用会话（首次提问或删除当前会话后自动创建）
+    _ensure_session(rag, db, cid)
 
     async def event_stream():
         try:
@@ -427,9 +441,9 @@ def delete_session(session_id: str, request: FastAPIRequest):
         except Exception as e:
             logger.warning(f"Failed to delete Neo4j session: {e}")
 
+    # 如果删除的是当前会话，置空（下次提问时自动创建新会话）
     if rag.current_session_id == session_id:
-        rag.current_session_id = rag.memory_module.create_session()
-        db.create_session(rag.current_session_id, client_id=cid)
+        rag.current_session_id = None
 
     return {"status": "deleted", "session_id": session_id}
 
