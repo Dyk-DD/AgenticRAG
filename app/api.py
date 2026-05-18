@@ -448,6 +448,26 @@ def delete_session(session_id: str, request: FastAPIRequest):
     return {"status": "deleted", "session_id": session_id}
 
 
+@app.put("/api/sessions/{session_id}/activate")
+def activate_session(session_id: str, request: FastAPIRequest):
+    """切换到指定历史会话，后续提问将延续该会话"""
+    cid = _get_patient(request)
+    rag = get_rag()
+    db = get_qa_db()
+
+    detail = db.get_session_detail(session_id, client_id=cid)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    # 关闭当前会话（flush 未持久化的轮次）
+    if rag.memory_module and rag.current_session_id:
+        rag.memory_module.close_session(rag.current_session_id)
+
+    rag.current_session_id = session_id
+    logger.info(f"已切换到会话: {session_id}")
+    return {"session_id": session_id}
+
+
 @app.post("/api/sessions")
 def create_session(request: FastAPIRequest):
     cid = _get_patient(request)
