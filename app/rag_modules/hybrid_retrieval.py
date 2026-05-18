@@ -273,7 +273,8 @@ class HybridRetrievalModule:
                         "entity_name": entity.entity_name,
                         "entity_type": entity.entity_type,
                         "index_keys": entity.index_keys,
-                        "matched_keyword": keyword
+                        "matched_keyword": keyword,
+                        "chunk_id": entity.metadata.get("chunk_id", f"{entity.metadata['node_id']}_full")
                     }
                 ))
         
@@ -332,17 +333,19 @@ class HybridRetrievalModule:
                     if record["answer"]:
                         content_parts.append(f"【当时医生诊断】: {record['answer']}")
 
+                    _nid = str(record["node_id"])
                     results.append(RetrievalResult(
                         content='\n'.join(content_parts),
-                        node_id=str(record["node_id"]),
+                        node_id=_nid,
                         node_type="Consultation",
-                        relevance_score=0.75,  # 提高基础权重，因为实体匹配的精准度通常较高
+                        relevance_score=0.75,
                         retrieval_level="entity",
                         metadata={
                             "title": record["title"],
                             "department": record["department"],
                             "matched_keyword": record["matched_keyword"],
-                            "source": "neo4j_entity_fallback"
+                            "source": "neo4j_entity_fallback",
+                            "chunk_id": f"{_nid}_full" if _nid.startswith("qa_") else ""
                         }
                     ))
         except Exception as e:
@@ -377,11 +380,12 @@ class HybridRetrievalModule:
                         newline = '\n'
                         content_parts.append(f"病例详情: {source_entity.value_content.split(newline)[0]}")
 
+                    _sid = relation.source_entity
                     results.append(RetrievalResult(
                         content='\n'.join(content_parts),
-                        node_id=relation.source_entity,  # 以主要实体为ID
+                        node_id=_sid,
                         node_type=source_entity.entity_type,
-                        relevance_score=0.95,  # 主题匹配得分
+                        relevance_score=0.95,
                         retrieval_level="topic",
                         metadata={
                             "relation_id": relation.relation_id,
@@ -389,7 +393,8 @@ class HybridRetrievalModule:
                             "source_name": source_entity.entity_name,
                             "target_name": target_entity.entity_name,
                             "matched_keyword": keyword,
-                            "index_keys": relation.index_keys
+                            "index_keys": relation.index_keys,
+                            "chunk_id": f"{_sid}_full" if str(_sid).startswith("qa_") else ""
                         }
                     ))
 
@@ -404,17 +409,19 @@ class HybridRetrievalModule:
                         entity.value_content
                     ]
 
+                    _nid = entity.metadata["node_id"]
                     results.append(RetrievalResult(
                         content='\n'.join(content_parts),
-                        node_id=entity.metadata["node_id"],
+                        node_id=_nid,
                         node_type=entity.entity_type,
-                        relevance_score=0.85,  # 分类匹配得分
+                        relevance_score=0.85,
                         retrieval_level="topic",
                         metadata={
                             "entity_name": entity.entity_name,
                             "entity_type": entity.entity_type,
                             "matched_keyword": keyword,
-                            "source": "category_match"
+                            "source": "category_match",
+                            "chunk_id": f"{_nid}_full" if str(_nid).startswith("qa_") else ""
                         }
                     ))
 
@@ -467,17 +474,19 @@ class HybridRetrievalModule:
                         f"【当时医生诊断】: {record['answer']}"
                     ]
 
+                    _nid = record["node_id"]
                     results.append(RetrievalResult(
                         content='\n'.join(content_parts),
-                        node_id=record["node_id"],
+                        node_id=_nid,
                         node_type="Consultation",
-                        relevance_score=0.75,  # 补充检索得分
+                        relevance_score=0.75,
                         retrieval_level="topic",
                         metadata={
                             "title": record["title"],
                             "department": record["department"],
                             "matched_keyword": record["matched_keyword"],
-                            "source": "neo4j_fallback"
+                            "source": "neo4j_fallback",
+                            "chunk_id": f"{_nid}_full" if str(_nid).startswith("qa_") else ""
                         }
                     ))
 
