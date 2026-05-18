@@ -191,11 +191,11 @@ class ClinicalDecisionSystem:
         self.graph_rag_retrieval.initialize()
 
         self.system_ready = True
-        print("✅ 临床检索引擎初始化完成！")
+        print("[OK] 临床检索引擎初始化完成！")
 
     def _show_knowledge_base_stats(self):
         """显示临床知识库统计信息"""
-        print(f"\n🏥 临床知识库统计:")
+        print(f"\n[知识库统计]:")
 
         # 数据统计 (适配 MedicalDataPreparationModule 的返回结构)
         stats = self.data_module.get_statistics()
@@ -218,7 +218,7 @@ class ClinicalDecisionSystem:
         # 打印核心科室分布
         if stats.get('departments_distribution'):
             departments = list(stats['departments_distribution'].keys())[:10]
-            print(f"   🏷️ 核心科室: {', '.join(departments)}")
+            print(f"   核心科室: {', '.join(departments)}")
 
     def ask_question_with_routing(self, question: str, stream: bool = False, explain_routing: bool = False):
         """
@@ -227,7 +227,7 @@ class ClinicalDecisionSystem:
         if not getattr(self, 'system_ready', False):
             raise ValueError("系统未就绪，请先构建临床知识库")
 
-        print(f"\n🩺 患者/医生提问: {question}")
+        print(f"\n[患者/医生] 提问: {question}")
 
         router = getattr(self, 'router', getattr(self, 'query_router', None))
 
@@ -242,26 +242,25 @@ class ClinicalDecisionSystem:
             # 0. 召回对话记忆上下文
             memory_context = ""
             if self.memory_module and self.current_session_id:
-                print("🧠 正在召回对话记忆...")
+                print("[记忆] 正在召回对话记忆...")
                 memory_context = self.memory_module.retrieve_memory_context(
                     question, self.current_session_id
                 )
                 if memory_context:
-                    print("   ✅ 记忆上下文已加载")
+                    print("   [OK] 记忆上下文已加载")
 
             # 1. 智能路由检索
             print("执行智能临床查询路由...")
             relevant_docs, analysis = router.route_query(question, self.config.top_k)
 
             # 2. 显示路由信息
-            strategy_icons = {
-                "hybrid_traditional": "🔍",
-                "graph_rag": "🧬",
-                "combined": "🏥"
+            strategy_labels = {
+                "hybrid_traditional": "传统混合检索",
+                "graph_rag": "图RAG检索",
+                "combined": "组合策略"
             }
-            strategy_icon = strategy_icons.get(analysis.recommended_strategy.value, "❓")
-            print(f"{strategy_icon} 系统调度策略: {analysis.recommended_strategy.value}")
-            print(f"📊 临床复杂度: {analysis.query_complexity:.2f}, 关系密集度: {analysis.relationship_intensity:.2f}")
+            strategy_label = strategy_labels.get(analysis.recommended_strategy.value, "未知")
+            print(f"[路由] {strategy_label} | 复杂度: {analysis.query_complexity:.2f} | 关系密集度: {analysis.relationship_intensity:.2f}")
 
             # 3. 显示检索结果信息
             if relevant_docs:
@@ -272,14 +271,14 @@ class ClinicalDecisionSystem:
                     score = doc.metadata.get('final_score', doc.metadata.get('relevance_score', 0))
                     doc_info.append(f"《{title}》({search_type}, {score:.3f})")
 
-                print(f"📋 找到 {len(relevant_docs)} 份相关临床参考: {', '.join(doc_info[:3])}")
+                print(f"[参考] 找到 {len(relevant_docs)} 份相关临床参考: {', '.join(doc_info[:3])}")
                 if len(doc_info) > 3:
                     print(f"    等共 {len(relevant_docs)} 个参考结果...")
             else:
                 return "抱歉，没有找到相关的临床医学参考信息。请尝试补充更多症状或更换提问方式。", analysis
 
             # 4. 生成回答
-            print("👨‍⚕️ 智能生成临床辅助建议...\n")
+            print("[生成] 智能生成临床辅助建议...\n")
 
             if stream:
                 try:
@@ -289,7 +288,7 @@ class ClinicalDecisionSystem:
                     result = "流式输出完成"
                 except Exception as stream_error:
                     logger.error(f"流式输出过程中出现错误: {stream_error}")
-                    print(f"\n⚠️ 网络或流式输出中断，正在为您切换到标准模式...")
+                    print(f"\n[警告] 网络或流式输出中断，正在为您切换到标准模式...")
                     result = self.generation_module.generate_adaptive_answer(question, relevant_docs, memory_context)
                     print(result)
             else:
@@ -309,7 +308,7 @@ class ClinicalDecisionSystem:
 
             # 6. 性能统计
             end_time = time.time()
-            print(f"\n⏱️ 诊断处理完成，耗时: {end_time - start_time:.2f}秒")
+            print(f"\n[耗时] 诊断处理完成，耗时: {end_time - start_time:.2f}秒")
 
             return result, analysis
 
@@ -320,7 +319,7 @@ class ClinicalDecisionSystem:
     def run_interactive(self):
         """运行交互式问诊循环"""
         if not getattr(self, 'system_ready', False):
-            print("❌ 系统未就绪，请先构建临床知识库")
+            print("[错误] 系统未就绪，请先构建临床知识库")
             return
 
         print("\n" + "=" * 55)
@@ -334,7 +333,7 @@ class ClinicalDecisionSystem:
 
         while True:
             try:
-                user_input = input("\n🩺 请输入医学咨询问题: ").strip()
+                user_input = input("\n请输入医学咨询问题: ").strip()
 
                 if not user_input:
                     continue
@@ -374,12 +373,12 @@ class ClinicalDecisionSystem:
                 import traceback
                 traceback.print_exc()
 
-        print("\n👋 感谢使用临床决策辅助系统，再见！")
+        print("\n感谢使用临床决策辅助系统，再见！")
         self._cleanup()
 
     def _show_system_stats(self):
         """显示临床系统统计信息"""
-        print("\n🏥 临床系统运行统计")
+        print("\n[系统运行统计]")
         print("=" * 40)
 
         router = getattr(self, 'router', getattr(self, 'query_router', None))
@@ -410,28 +409,28 @@ class ClinicalDecisionSystem:
 
     def _rebuild_knowledge_base(self):
         """重建临床知识库"""
-        print("\n⚠️ 准备重建临床知识库...")
+        print("\n[警告] 准备重建临床知识库...")
 
-        confirm = input("⚠️  这将清空现有的医疗向量数据并重新解析重建，是否继续？(y/N): ").strip().lower()
+        confirm = input("这将清空现有的医疗向量数据并重新解析重建，是否继续？(y/N): ").strip().lower()
         if confirm != 'y':
-            print("❌ 重建操作已取消")
+            print("[取消] 重建操作已取消")
             return
 
         try:
             print("清理现有的 Milvus 医疗向量集合...")
             if self.index_module.delete_collection():
-                print("✅ 现有数据集合已清除")
+                print("[OK] 现有数据集合已清除")
             else:
                 print("清理集合时出现警告，尝试强制覆盖重建...")
 
             print("开始重新构建临床知识图谱与向量库...")
             self.build_knowledge_base()
 
-            print("✅ 临床知识库重建完成，系统已就绪！")
+            print("[OK] 临床知识库重建完成，系统已就绪！")
 
         except Exception as e:
             logger.error(f"重建临床知识库失败: {e}")
-            print(f"❌ 重建失败: {e}")
+            print(f"[失败] 重建失败: {e}")
             print("建议：请检查 Milvus 和 Neo4j 服务连接状态后重试")
     
     def _cleanup(self):
@@ -452,15 +451,15 @@ class ClinicalDecisionSystem:
     def add_new_knowledge(self, csv_filepath: str):
         """增量添加新知识：处理全新的CSV文件并追加到数据库"""
         if not os.path.exists(csv_filepath):
-            print(f"❌ 找不到文件: {csv_filepath}")
+            print(f"[失败] 找不到文件: {csv_filepath}")
             return
 
-        print(f"\n📦 开始增量导入新数据: {csv_filepath}")
+        print(f"\n[增量导入] 开始增量导入新数据: {csv_filepath}")
 
         # 1. 读取新的 CSV 数据
         self.data_module.load_single_csv(csv_filepath)
         if not getattr(self.data_module, 'qa_pairs', None):
-            print("❌ 没有提取到有效数据，增量导入终止")
+            print("[错误] 没有提取到有效数据，增量导入终止")
             return
 
         # 2. 追加到 Neo4j 图数据库
@@ -478,9 +477,9 @@ class ClinicalDecisionSystem:
         if new_chunks:
             print(f"正在将 {len(new_chunks)} 条新向量追加到 Milvus 数据库...")
             if self.index_module.add_documents(new_chunks):
-                print("✅ 向量库追加成功！")
+                print("[OK] 向量库追加成功！")
             else:
-                print("❌ 向量库追加失败！")
+                print("[错误] 向量库追加失败！")
 
         # 5. 刷新系统的内存检索引擎状态
         print("正在刷新混合检索引擎状态，加载最新数据...")
@@ -493,13 +492,13 @@ class ClinicalDecisionSystem:
             if self.traditional_retrieval.bm25_retriever:
                 self.traditional_retrieval.bm25_retriever.add_documents(new_chunks)
 
-        print("🎉 增量知识更新完成！您可以立即开始针对新数据的问诊。")
+        print("[完成] 增量知识更新完成！您可以立即开始针对新数据的问诊。")
 
 
 def main():
     """主函数入口"""
     try:
-        print("🚀 正在启动 临床决策与辅助系统 (Clinical Decision Support System)...")
+        print("正在启动 临床决策与辅助系统 (Clinical Decision Support System)...")
 
         # 使用你新定义的类名
         rag_system = ClinicalDecisionSystem()
@@ -517,7 +516,7 @@ def main():
         logger.error(f"系统运行失败: {e}")
         import traceback
         traceback.print_exc()
-        print(f"\n❌ 系统致命错误: {e}")
+        print(f"\n[致命错误] 系统致命错误: {e}")
 
 
 if __name__ == "__main__":

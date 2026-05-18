@@ -76,24 +76,49 @@ class MedicalDataPreparationModule:
             return []
         matches = self._disease_pattern.findall(combined_text)
         return list(set(matches))
-    
+
+    def _extract_drugs(self, text: str) -> list:
+        """
+        从文本中提取药物实体。
+        使用常见药物后缀和关键词模式匹配，不依赖外部词典。
+        """
+        if not text:
+            return []
+
+        # 常见药物后缀和模式
+        drug_patterns = [
+            r'[一-龥]{2,8}(?:片|胶囊|口服液|颗粒|滴丸|软膏|注射液|冲剂|散剂|合剂|酊剂|贴膏|乳膏|喷雾剂|气雾剂|栓剂|凝胶|溶液|滴眼液|滴剂|糖浆|膏剂|丸)',
+            r'(?:盐酸|硝酸|硫酸|磷酸|氢氯|氢溴|枸橼酸|乳酸|葡萄糖酸|马来酸|酒石酸|苯磺酸|甲磺酸|琥珀酸|富马酸|醋酸|乙酰)[一-龥]{2,6}(?:片|胶囊|口服液)?',
+            r'(?:阿莫西林|头孢|青霉素|红霉素|罗红霉素|阿奇霉素|克林霉素|左氧氟沙星|诺氟沙星|奥美拉唑|雷贝拉唑|泮托拉唑|埃索美拉唑|西咪替丁|雷尼替丁|法莫替丁|多潘立酮|莫沙必利|甲氧氯普胺|硝苯地平|氨氯地平|非洛地平|拉西地平|卡托普利|依那普利|贝那普利|缬沙坦|氯沙坦|厄贝沙坦|替米沙坦|美托洛尔|比索洛尔|普萘洛尔|阿托伐他汀|瑞舒伐他汀|辛伐他汀|普伐他汀|非诺贝特|苯磺酸|二甲双胍|格列本脲|格列美脲|格列齐特|阿卡波糖|胰岛素|华法林|氯吡格雷|阿司匹林|布洛芬|对乙酰氨基酚|双氯芬酸|塞来昔布|泼尼松|地塞米松|甲泼尼龙|左甲状腺素|丙硫氧嘧啶|甲巯咪唑|地高辛|胺碘酮|硝酸甘油|硝普钠|呋塞米|氢氯噻嗪|螺内酯|甘露醇|苯妥英钠|卡马西平|丙戊酸钠|苯巴比妥|地西泮|阿普唑仑|艾司唑仑|氯氮平|奥氮平|利培酮|喹硫平|舍曲林|帕罗西汀|氟西汀|西酞普兰|文拉法辛|度洛西汀|多塞平|阿米替林|氯丙嗪|奋乃静|氟哌啶醇|硫必利|金刚烷胺|左旋多巴|多巴丝肼|恩他卡朋|司来吉兰|新斯的明|溴吡斯的明|阿托品|山莨菪碱|东莨菪碱|间苯三酚|曲马多|吗啡|哌替啶|芬太尼|可待因|氨茶碱|沙丁胺醇|特布他林|布地奈德|氟替卡松|异丙托溴铵|噻托溴铵|孟鲁司特|酮替芬|氯雷他定|西替利嗪|依巴斯汀|咪唑斯汀|氯苯那敏|苯海拉明|异丙嗪|茶苯海明)',
+        ]
+
+        found = []
+        for pattern in drug_patterns:
+            matches = re.findall(pattern, text)
+            found.extend(matches)
+
+        # 去重并按长度排序（长匹配优先）
+        return sorted(set(found), key=len, reverse=True)
+
     def _connect(self):
-        """建立Neo4j连接"""
+        """建立Neo4j连接（带超时保护）"""
         try:
             self.driver = GraphDatabase.driver(
-                self.uri, 
+                self.uri,
                 auth=(self.user, self.password),
-                database=self.database
+                database=self.database,
+                connection_timeout=10,  # 10秒连接超时，避免无限等待
+                max_connection_lifetime=300,
             )
             logger.info(f"已连接到Neo4j数据库: {self.uri}")
-            
+
             # 测试连接
             with self.driver.session() as session:
                 result = session.run("RETURN 1 as test")
                 test_result = result.single()
                 if test_result:
                     logger.info("Neo4j连接测试成功")
-                    
+
         except Exception as e:
             logger.error(f"连接Neo4j失败: {e}")
             raise
@@ -228,6 +253,24 @@ class MedicalDataPreparationModule:
                             MERGE (c)-[:MENTIONS_DISEASE]->(dis)
                             """
                             session.run(disease_cypher, batch=batch_data)
+
+                            # 批量写入3: 提取药物并创建药物节点及关联
+                            drug_texts = []
+                            for item in batch_data:
+                                combined = f"{item['title']} {item.get('ask', '')} {item.get('answer', '')}"
+                                drugs = self._extract_drugs(combined)
+                                if drugs:
+                                    drug_texts.append({"node_id": item['node_id'], "drugs": drugs})
+
+                            if drug_texts:
+                                drug_cypher = """
+                                UNWIND $batch AS data
+                                UNWIND data.drugs AS drug_name
+                                MATCH (c:Consultation {nodeId: data.node_id})
+                                MERGE (dr:Drug {name: drug_name})
+                                MERGE (c)-[:MENTIONS_DRUG]->(dr)
+                                """
+                                session.run(drug_cypher, batch=drug_texts)
 
                         logger.info(
                             f"进度: 已处理 {idx + 1}/{total_pairs}, 成功写入 {success_count} 条, 跳过 {skipped_count} 条")

@@ -17,6 +17,8 @@ from transformers import AutoModelForSequenceClassification
 
 # 引入重构后的医学图索引模块
 from .graph_indexing import MedicalGraphIndexingModule
+from .utils import extract_json_from_llm
+import jieba
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +59,28 @@ class HybridRetrievalModule:
         """初始化检索系统"""
         logger.info("初始化临床混合检索模块...")
         
-        # 连接Neo4j
+        # 连接Neo4j（带超时保护）
         self.driver = GraphDatabase.driver(
-            self.config.neo4j_uri, 
-            auth=(self.config.neo4j_user, self.config.neo4j_password)
+            self.config.neo4j_uri,
+            auth=(self.config.neo4j_user, self.config.neo4j_password),
+            connection_timeout=10,
         )
         
         # 初始化BM25检索器
         if chunks:
-            self.bm25_retriever = BM25Retriever.from_documents(chunks)
-            logger.info(f"BM25检索器初始化完成，文档数量: {len(chunks)}")
+            # 配置中文分词器（jieba），否则 BM25 默认空格分词对中文完全无效
+            try:
+                from langchain_community.retrievers import BM25Retriever
+                # 为 BM25 配置 jieba 分词器
+                self.bm25_retriever = BM25Retriever.from_documents(
+                    chunks,
+                    preprocess_func=lambda x: list(jieba.cut(x))
+                )
+                logger.info(f"BM25检索器初始化完成（jieba分词），文档数量: {len(chunks)}")
+            except Exception as e:
+                # 降级：使用默认分词器（对中文效果差但不会崩溃）
+                self.bm25_retriever = BM25Retriever.from_documents(chunks)
+                logger.warning(f"jieba分词初始化失败，使用默认分词器: {e}")
         
         # 初始化图索引
         self._build_graph_index()
@@ -216,10 +230,9 @@ class HybridRetrievalModule:
 
             import re
             raw_content = response.choices[0].message.content.strip()
-            json_match = re.search(r'\{[\s\S]*\}', raw_content)
-            clean_content = json_match.group(0) if json_match else raw_content
-
-            result = json.loads(clean_content)
+            result = extract_json_from_llm(raw_content)
+            if result is None:
+                raise ValueError("无法从 LLM 输出中提取 JSON")
             entity_keywords = result.get("entity_keywords", [])
             topic_keywords = result.get("topic_keywords", [])
 
@@ -569,46 +582,57 @@ class HybridRetrievalModule:
             logger.error(f"获取医学邻居节点失败: {e}")
             return []
 
+    def _rrf_score(self, rank: int, k: int = 60) -> float:
+        """Reciprocal Rank Fusion 分数"""
+        return 1.0 / (k + rank)
+
     def hybrid_search(self, query: str, top_k: int = 5) -> List[Document]:
-        """混合检索：使用Round-robin轮询合并策略"""
-        logger.info(f"开始医学混合检索: {query}")
+        """
+        混合检索：使用 Reciprocal Rank Fusion (RRF) 替代 Round-robin。
+
+        RRF 优势：
+        1. 不需要跨系统的分数归一化（向量距离 vs 图关联度）
+        2. 对排序敏感而非分数敏感，鲁棒性更强
+        3. 理论上有据可查，广泛用于信息检索融合
+        """
+        logger.info(f"开始医学混合检索（RRF融合）: {query}")
 
         dual_docs = self.dual_level_retrieval(query, top_k)
         vector_docs = self.vector_search_enhanced(query, top_k)
 
+        # RRF 分数聚合
+        rrf_scores: Dict[str, float] = {}
+        doc_map: Dict[str, Document] = {}
+
+        def add_to_rrf(docs, source_name):
+            for rank, doc in enumerate(docs):
+                doc_id = doc.metadata.get("node_id", str(hash(doc.page_content)))
+                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + self._rrf_score(rank)
+                if doc_id not in doc_map:
+                    # 复制文档，避免引用冲突
+                    doc.metadata["search_method"] = source_name
+                    doc.metadata["rrf_contributions"] = []
+                    doc_map[doc_id] = doc
+                doc_map[doc_id].metadata.setdefault("rrf_contributions", []).append(
+                    {"source": source_name, "rank": rank, "rrf_score": self._rrf_score(rank)}
+                )
+
+        add_to_rrf(dual_docs, "dual_level")
+        add_to_rrf(vector_docs, "vector_enhanced")
+
+        # 按 RRF 总分降序排序
+        ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
         merged_docs = []
-        seen_doc_ids = set()
-        max_len = max(len(dual_docs), len(vector_docs))
+        for doc_id, score in ranked[:top_k]:
+            doc = doc_map[doc_id]
+            doc.metadata["final_score"] = round(score, 4)
+            doc.metadata["rrf_rank"] = len(merged_docs)
+            merged_docs.append(doc)
+
         origin_len = len(dual_docs) + len(vector_docs)
-
-        for i in range(max_len):
-            if i < len(dual_docs):
-                doc = dual_docs[i]
-                doc_id = doc.metadata.get("node_id", hash(doc.page_content))
-                if doc_id not in seen_doc_ids:
-                    seen_doc_ids.add(doc_id)
-                    doc.metadata["search_method"] = "dual_level"
-                    doc.metadata["round_robin_order"] = len(merged_docs)
-                    doc.metadata["final_score"] = doc.metadata.get("relevance_score", 0.0)
-                    merged_docs.append(doc)
-
-            if i < len(vector_docs):
-                doc = vector_docs[i]
-                doc_id = doc.metadata.get("node_id", hash(doc.page_content))
-                if doc_id not in seen_doc_ids:
-                    seen_doc_ids.add(doc_id)
-                    doc.metadata["search_method"] = "vector_enhanced"
-                    doc.metadata["round_robin_order"] = len(merged_docs)
-
-                    vector_score = doc.metadata.get("score", 0.0)
-                    similarity_score = max(0.0, 1.0 - vector_score) if vector_score <= 1.0 else 0.0
-                    doc.metadata["final_score"] = similarity_score
-                    merged_docs.append(doc)
-
-        final_docs = merged_docs[:top_k]
-
-        logger.info(f"临床Round-robin合并：从总共{origin_len}个结果合并为{len(final_docs)}个参考文档")
-        return final_docs
+        logger.info(f"RRF融合：从总共{origin_len}个结果合并为{len(merged_docs)}个参考文档")
+        return merged_docs
         
     def close(self):
         """关闭资源连接"""

@@ -14,6 +14,8 @@ import re
 
 from langchain_core.documents import Document
 
+from .utils import extract_json_from_llm
+
 logger = logging.getLogger(__name__)
 
 class SearchStrategy(Enum):
@@ -42,6 +44,10 @@ class IntelligentQueryRouter:
     3. 策略自动选择：路由到最适合的检索引擎
     """
 
+    # 与关联性深度推理相关的关键词
+    COMPLEXITY_KEYWORDS = ["并发症", "鉴别诊断", "禁忌", "副作用", "机理", "风险", "为什么", "方案", "预后", "严重"]
+    RELATION_KEYWORDS = ["配伍", "同服", "相互作用", "导致", "引发", "引起", "合并", "伴随"]
+
     def __init__(self,
                  traditional_retrieval,  # 传统混合检索模块
                  graph_rag_retrieval,  # 图RAG检索模块
@@ -59,6 +65,11 @@ class IntelligentQueryRouter:
             "combined_count": 0,
             "total_queries": 0
         }
+
+        # 疾病/药物实体词典缓存（用于规则降级）
+        self._disease_entity_cache: List[str] = []
+        self._drug_entity_cache: List[str] = []
+        self._entity_patterns = None
 
     def analyze_query(self, query: str) -> QueryAnalysis:
         """
@@ -122,16 +133,12 @@ class IntelligentQueryRouter:
             # 2. 获取原始返回文本
             raw_content = response.choices[0].message.content.strip()
 
-            # 3. 使用正则表达式，暴力提取第一个 { 到最后一个 } 之间的所有内容
-            json_match = re.search(r'\{[\s\S]*\}', raw_content)
+            # 3. 使用稳健的 JSON 提取
+            result = extract_json_from_llm(raw_content)
 
-            if json_match:
-                clean_content = json_match.group(0)
-            else:
-                clean_content = raw_content
-
-            # 4. 解析清理后的干净字符串
-            result = json.loads(clean_content)
+            if result is None:
+                logger.warning("LLM 返回中未能提取有效 JSON，降级为规则匹配")
+                return self._rule_based_analysis(query)
 
             analysis = QueryAnalysis(
                 query_complexity=float(result.get("query_complexity", 0.5)),
@@ -150,29 +157,75 @@ class IntelligentQueryRouter:
             logger.error(f"临床查询分析失败，降级为规则匹配: {e}")
             return self._rule_based_analysis(query)
 
+    def load_entity_cache(self):
+        """从 Neo4j 加载疾病和药物实体，增强规则降级覆盖率"""
+        try:
+            driver = getattr(self.graph_rag_retrieval, 'driver', None)
+            if driver:
+                with driver.session() as s:
+                    diseases = s.run("MATCH (d:Disease) RETURN d.name AS name").data()
+                    self._disease_entity_cache = [r['name'] for r in diseases if r.get('name')]
+                    try:
+                        drugs = s.run("MATCH (d:Drug) RETURN d.name AS name").data()
+                        self._drug_entity_cache = [r['name'] for r in drugs if r.get('name')]
+                    except Exception:
+                        self._drug_entity_cache = []
+        except Exception:
+            # 如果图还没有疾病/药物，使用空列表
+            self._disease_entity_cache = []
+            self._drug_entity_cache = []
+
+        # 编译实体模式
+        all_entities = self._disease_entity_cache + self._drug_entity_cache
+        if all_entities:
+            escaped = [re.escape(e) for e in sorted(all_entities, key=len, reverse=True)]
+            self._entity_patterns = re.compile('|'.join(escaped))
+        else:
+            self._entity_patterns = None
+
+        logger.info(f"路由器实体缓存已加载: {len(self._disease_entity_cache)} 疾病, {len(self._drug_entity_cache)} 药物")
+
     def _rule_based_analysis(self, query: str) -> QueryAnalysis:
-        """基于医学特征规则的降级分析"""
-        # 替换为医疗场景下的复杂查询特征词
-        complexity_keywords = ["并发症", "鉴别诊断", "禁忌", "副作用", "机理", "风险", "为什么", "方案", "预后", "严重"]
-        relation_keywords = ["配伍", "同服", "相互作用", "导致", "引发", "引起", "合并", "伴随"]
+        """基于医学特征规则的降级分析（增强版：关键词 + 实体匹配）"""
+        # 如果实体缓存未加载，尝试加载
+        if not self._disease_entity_cache and not self._drug_entity_cache:
+            self.load_entity_cache()
 
-        complexity = sum(1 for kw in complexity_keywords if kw in query) / max(1, len(complexity_keywords))
-        relation_intensity = sum(1 for kw in relation_keywords if kw in query) / max(1, len(relation_keywords))
+        # 1. 关键词匹配（原有逻辑）
+        complexity = sum(1 for kw in self.COMPLEXITY_KEYWORDS if kw in query) / max(1, len(self.COMPLEXITY_KEYWORDS))
+        relation_intensity = sum(1 for kw in self.RELATION_KEYWORDS if kw in query) / max(1, len(self.RELATION_KEYWORDS))
 
-        # 医学问题容错率低，只要触发任何复杂词或关系词，立刻上强度切入图查询
-        if complexity > 0.0 or relation_intensity > 0.0:
+        # 2. 实体匹配 —— 检查是否命中疾病/药物实体
+        entity_hits = 0
+        if self._entity_patterns:
+            matches = self._entity_patterns.findall(query)
+            entity_hits = len(matches)
+
+        # 3. 多实体出现在同一查询中往往需要图推理（如药物-疾病相互作用）
+        multi_entity_graph_needed = entity_hits >= 2
+
+        # 判断是否需要图检索
+        needs_graph = (complexity > 0.0 or relation_intensity > 0.0 or multi_entity_graph_needed)
+
+        if needs_graph:
             strategy = SearchStrategy.GRAPH_RAG
         else:
             strategy = SearchStrategy.HYBRID_TRADITIONAL
 
+        # 计算综合复杂度
+        combined_complexity = min(
+            complexity * 3 + (entity_hits * 0.15),
+            1.0
+        )
+
         return QueryAnalysis(
-            query_complexity=min(complexity * 3, 1.0),
-            relationship_intensity=min(relation_intensity * 3, 1.0),
-            reasoning_required=(complexity > 0.0),
-            entity_count=len(query.split()),  # 粗略估计
+            query_complexity=combined_complexity,
+            relationship_intensity=min(relation_intensity * 3 + (0.2 if multi_entity_graph_needed else 0.0), 1.0),
+            reasoning_required=(complexity > 0.0 or multi_entity_graph_needed),
+            entity_count=max(entity_hits, len(query.split()) // 2),
             recommended_strategy=strategy,
-            confidence=0.6,
-            reasoning="基于临床术语特征触发的规则分析"
+            confidence=0.65 if multi_entity_graph_needed else 0.6,
+            reasoning="基于临床术语特征和实体匹配触发的规则分析"
         )
 
     def route_query(self, query: str, top_k: int = 5) -> Tuple[List[Document], QueryAnalysis]:
@@ -221,42 +274,30 @@ class IntelligentQueryRouter:
 
     def _combined_search(self, query: str, top_k: int) -> List[Document]:
         """
-        组合搜索策略：结合传统检索和图RAG的优势
+        组合搜索策略：RRF 融合传统检索和图 RAG 结果，替代 round-robin
         """
-        # 分配结果数量
-        traditional_k = max(1, top_k // 2)
-        graph_k = top_k - traditional_k
+        # 多取一些保证 RRF 排名充分
+        traditional_docs = self.traditional_retrieval.hybrid_search(query, top_k * 2)
+        graph_docs = self.graph_rag_retrieval.graph_rag_search(query, top_k * 2)
 
-        # 执行两种检索
-        traditional_docs = self.traditional_retrieval.hybrid_search(query, traditional_k)
-        graph_docs = self.graph_rag_retrieval.graph_rag_search(query, graph_k)
+        rrf_scores: Dict[str, float] = {}
+        doc_map: Dict[str, Document] = {}
+        K = 60  # RRF 常数
 
-        # 合并和去重
-        combined_docs = []
-        seen_contents = set()
+        def index_docs(docs, source):
+            for rank, doc in enumerate(docs):
+                doc_id = doc.metadata.get("node_id", str(hash(doc.page_content[:200])))
+                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (K + rank)
+                if doc_id not in doc_map:
+                    doc.metadata["search_source"] = source
+                    doc_map[doc_id] = doc
 
-        # 交替添加结果（Round-robin）
-        max_len = max(len(traditional_docs), len(graph_docs))
-        for i in range(max_len):
-            # 先添加图RAG结果（通常质量更高）
-            if i < len(graph_docs):
-                doc = graph_docs[i]
-                content_hash = hash(doc.page_content[:100])
-                if content_hash not in seen_contents:
-                    seen_contents.add(content_hash)
-                    doc.metadata["search_source"] = "medical_graph_rag"
-                    combined_docs.append(doc)
+        index_docs(traditional_docs, "medical_traditional")
+        index_docs(graph_docs, "medical_graph_rag")
 
-            # 再添加传统检索结果
-            if i < len(traditional_docs):
-                doc = traditional_docs[i]
-                content_hash = hash(doc.page_content[:100])
-                if content_hash not in seen_contents:
-                    seen_contents.add(content_hash)
-                    doc.metadata["search_source"] = "medical_traditional"
-                    combined_docs.append(doc)
-
-        return combined_docs[:top_k]
+        ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        result = [doc_map[doc_id] for doc_id, _ in ranked[:top_k]]
+        return result
     
     def _post_process_results(self, documents: List[Document], analysis: QueryAnalysis) -> List[Document]:
         """

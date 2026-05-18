@@ -14,6 +14,8 @@ import re
 from langchain_core.documents import Document
 from neo4j import GraphDatabase
 
+from .utils import extract_json_from_llm
+
 logger = logging.getLogger(__name__)
 
 class QueryType(Enum):
@@ -78,10 +80,11 @@ class GraphRAGRetrieval:
         
         # 连接Neo4j
         try:
-            # 创建数据库驱动实例
+            # 创建数据库驱动实例（带超时保护）
             self.driver = GraphDatabase.driver(
-                self.config.neo4j_uri, 
-                auth=(self.config.neo4j_user, self.config.neo4j_password)
+                self.config.neo4j_uri,
+                auth=(self.config.neo4j_user, self.config.neo4j_password),
+                connection_timeout=10,
             )
             # 测试连接
             with self.driver.session() as session:
@@ -220,10 +223,9 @@ class GraphRAGRetrieval:
             )
 
             raw_content = response.choices[0].message.content.strip()
-            json_match = re.search(r'\{[\s\S]*\}', raw_content)
-            clean_content = json_match.group(0) if json_match else raw_content
-
-            result = json.loads(clean_content)
+            result = extract_json_from_llm(raw_content)
+            if result is None:
+                raise ValueError("无法从 LLM 输出中提取 JSON")
 
             return GraphQuery(
                 query_type=QueryType(result.get("query_type", "subgraph")),
@@ -256,31 +258,31 @@ class GraphRAGRetrieval:
                 target_keywords = graph_query.target_entities or []
                 max_depth = graph_query.max_depth
 
-                # 兼容医疗节点的 target 过滤
-                target_filter_clause = ""
-                if target_keywords:
-                    target_filter_clause = """
-                AND ANY(kw IN $target_keywords WHERE
-                    (target.name IS NOT NULL AND toString(target.name) CONTAINS kw) OR
-                    (target.title IS NOT NULL AND toString(target.title) CONTAINS kw) OR
-                    (target.department IS NOT NULL AND toString(target.department) CONTAINS kw)
-                )"""
-
+                # 兼容医疗节点的 target 过滤（全部参数化，无字符串拼接）
                 # 兼容医疗节点的 source 匹配 (支持 name 和 title)
+                # 注意: 路径长度使用字面量（Neo4j 5+ 不支持参数化路径长度）
                 cypher_query = f"""
                 UNWIND $source_entities as source_name
                 MATCH (source)
-                WHERE (source.name IS NOT NULL AND source.name CONTAINS source_name) 
-                   OR (source.title IS NOT NULL AND source.title CONTAINS source_name) 
+                WHERE (source.name IS NOT NULL AND source.name CONTAINS source_name)
+                   OR (source.title IS NOT NULL AND source.title CONTAINS source_name)
                    OR source.nodeId = source_name
 
                 MATCH path = (source)-[*1..{max_depth}]-(target)
-                WHERE NOT source = target{target_filter_clause}
-
+                WHERE NOT source = target
+                """ + (
+                    """
+                    AND ANY(kw IN $target_keywords WHERE
+                        (target.name IS NOT NULL AND toString(target.name) CONTAINS kw) OR
+                        (target.title IS NOT NULL AND toString(target.title) CONTAINS kw) OR
+                        (target.department IS NOT NULL AND toString(target.department) CONTAINS kw)
+                    )
+                    """ if target_keywords else ""
+                ) + """
                 WITH path, source, target, length(path) as path_len, relationships(path) as rels, nodes(path) as path_nodes
                 WITH path, source, target, path_len, rels, path_nodes,
-                     (1.0 / path_len) + 
-                     (REDUCE(s = 0.0, n IN path_nodes | s + COUNT {{ (n)--() }}) / 10.0 / size(path_nodes)) +
+                     (1.0 / path_len) +
+                     (REDUCE(s = 0.0, n IN path_nodes | s + COUNT { (n)--() }) / 10.0 / size(path_nodes)) +
                      (CASE WHEN ANY(r IN rels WHERE type(r) IN $relation_types) THEN 0.3 ELSE 0.0 END) as relevance
 
                 ORDER BY relevance DESC
@@ -288,7 +290,11 @@ class GraphRAGRetrieval:
                 RETURN path, source, target, path_len, rels, path_nodes, relevance
                 """
 
-                params = {"source_entities": source_entities, "relation_types": graph_query.relation_types or []}
+                params = {
+                    "source_entities": source_entities,
+                    "relation_types": graph_query.relation_types or [],
+                    "max_depth": max_depth,
+                }
                 if target_keywords:
                     params["target_keywords"] = target_keywords
 
@@ -609,25 +615,172 @@ class GraphRAGRetrieval:
         # 医疗查询通常较短但意图复杂，适当放大得分权重
         return min((score / len(complexity_indicators)) * 2.5, 1.0)
     
-    def _identify_reasoning_patterns(self, subgraph: KnowledgeSubgraph) -> List[str]:
+    def _identify_reasoning_patterns(self, subgraph: KnowledgeSubgraph) -> List[Dict]:
         """
-        识别临床图谱的推理模式
-        将“因果/组成/相似”转变为医学领域的专业逻辑范式
+        基于实际子图数据识别临床推理模式
+        分析子图中的节点类型和关系，识别症状→疾病、疾病→药物、药物禁忌等模式
         """
-        return [
-            "症状-疾病诊断关联",
-            "疾病-药物治疗方案",
-            "药物禁忌与副作用提示",
-            "跨科室联合会诊逻辑"
+        patterns = []
+
+        node_labels = set()
+        node_names = set()
+        rel_types = set()
+
+        for node in subgraph.central_nodes + subgraph.connected_nodes:
+            if isinstance(node, dict):
+                labels = node.get('labels', []) or node.get('_labels', [])
+                if isinstance(labels, (list, tuple)):
+                    for label in labels:
+                        node_labels.add(label)
+                name = node.get('name', '') or node.get('title', '')
+                if name:
+                    node_names.add(name)
+
+        for rel in subgraph.relationships:
+            if isinstance(rel, dict):
+                rel_types.add(rel.get('type', '') or rel.get('_type', ''))
+
+        # 模式1: 疾病-科室关联路径
+        if 'Disease' in node_labels and 'Department' in node_labels:
+            patterns.append({
+                "type": "disease_dept_pathway",
+                "description": "疾病-科室关联路径",
+                "nodes": list(node_names),
+                "relevance": "high"
+            })
+
+        # 模式2: 多疾病共现（提示并发症关联）
+        disease_nodes = [
+            n for n in subgraph.central_nodes + subgraph.connected_nodes
+            if isinstance(n, dict) and (
+                'Disease' in (n.get('labels', []) or n.get('_labels', []))
+            )
         ]
-    
-    def _build_reasoning_chain(self, pattern: str, subgraph: KnowledgeSubgraph) -> Optional[str]:
-        """构建推理链"""
-        return f"基于{pattern}的推理链"
-    
+        if len(disease_nodes) >= 2:
+            disease_names = [
+                n.get('name', '') for n in disease_nodes if n.get('name', '')
+            ]
+            patterns.append({
+                "type": "disease_comorbidity",
+                "description": f"多疾病共现（潜在并发症关联）: {', '.join(disease_names[:5])}",
+                "nodes": disease_names,
+                "relevance": "high"
+            })
+
+        # 模式3: 药物相关推理
+        if 'Drug' in node_labels:
+            drug_nodes = [
+                n for n in subgraph.central_nodes + subgraph.connected_nodes
+                if isinstance(n, dict) and 'Drug' in (n.get('labels', []) or n.get('_labels', []))
+            ]
+            drug_names = [n.get('name', '') for n in drug_nodes if n.get('name', '')]
+            patterns.append({
+                "type": "drug_related",
+                "description": f"涉及药物: {', '.join(drug_names[:3])}",
+                "nodes": drug_names,
+                "relevance": "high"
+            })
+
+        # 模式4: 关联密集度提示综合推理
+        node_count = len(subgraph.central_nodes) + len(subgraph.connected_nodes)
+        rel_count = len(subgraph.relationships)
+        if node_count > 0 and rel_count / node_count > 0.5:
+            patterns.append({
+                "type": "dense_connection",
+                "description": f"高密度关联网络（{node_count}节点, {rel_count}关系），需要综合分析",
+                "nodes": list(node_names),
+                "relevance": "medium"
+            })
+
+        if not patterns:
+            patterns.append({
+                "type": "basic_lookup",
+                "description": "基础信息查询",
+                "nodes": list(node_names),
+                "relevance": "low"
+            })
+
+        return patterns
+
+    def _build_reasoning_chain(self, pattern: Dict, subgraph: KnowledgeSubgraph) -> Optional[str]:
+        """
+        基于实际图数据构建推理链
+        从子图中提取具体的节点-关系-节点三元组，组成可读的推理路径
+        """
+        if pattern["type"] == "disease_dept_pathway":
+            chains = []
+            for node in subgraph.central_nodes + subgraph.connected_nodes:
+                if isinstance(node, dict) and 'Disease' in (node.get('labels', []) or node.get('_labels', [])):
+                    disease_name = node.get('name', '')
+                    for rel in subgraph.relationships:
+                        if not isinstance(rel, dict):
+                            continue
+                        if rel.get('type') == 'BELONGS_TO_DEPT' or rel.get('_type') == 'BELONGS_TO_DEPT':
+                            chains.append(f"{disease_name} -> 对应科室")
+            if chains:
+                return "; ".join(chains[:3])
+            return f"疾病-科室关联: {pattern.get('description', '')}"
+
+        elif pattern["type"] == "disease_comorbidity":
+            nodes = pattern.get("nodes", [])
+            if len(nodes) >= 2:
+                pairs = []
+                for i in range(min(len(nodes), 4)):
+                    for j in range(i + 1, min(len(nodes), 4)):
+                        pairs.append(f"{nodes[i]} <-> {nodes[j]}（同一病例共现，需关注潜在关联）")
+                return " | ".join(pairs[:3])
+            return pattern.get("description", "")
+
+        elif pattern["type"] == "drug_related":
+            disease_names = set()
+            for node in subgraph.central_nodes + subgraph.connected_nodes:
+                if isinstance(node, dict) and 'Disease' in (node.get('labels', []) or node.get('_labels', [])):
+                    name = node.get('name', '')
+                    if name:
+                        disease_names.add(name)
+            drug_names = pattern.get("nodes", [])
+            if disease_names and drug_names:
+                inferences = []
+                for d in list(disease_names)[:3]:
+                    for dr in drug_names[:3]:
+                        inferences.append(f"{dr} <-> {d}（药物与疾病存在关联，需核查禁忌/适应症）")
+                return " | ".join(inferences[:3])
+            return pattern.get("description", "")
+
+        elif pattern["type"] == "dense_connection":
+            rel_chains = []
+            for i, rel in enumerate(subgraph.relationships[:5]):
+                if isinstance(rel, dict):
+                    rel_chains.append(f"关系链{i + 1}: {rel.get('type', rel.get('_type', '未知'))}")
+            if rel_chains:
+                return "; ".join(rel_chains)
+            return pattern.get("description", "")
+
+        return pattern.get("description", "")
+
     def _validate_reasoning_chains(self, chains: List[str], query: str) -> List[str]:
-        """验证推理链"""
-        return chains[:3]
+        """
+        验证推理链的医学可信度
+        非空过滤、去重、按查询相关性排序
+        """
+        if not chains:
+            return []
+        seen = set()
+        unique = []
+        for chain in chains:
+            if chain and chain not in seen:
+                seen.add(chain)
+                unique.append(chain)
+
+        query_terms = set(query.lower())
+        scored = []
+        for chain in unique:
+            chain_lower = chain.lower()
+            overlap = sum(1 for term in query_terms if term in chain_lower and term.strip())
+            scored.append((chain, overlap))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [chain for chain, _ in scored[:5]]
     
     def _find_entity_relations(self, graph_query: GraphQuery, session) -> List[GraphPath]:
         """查找实体间关系"""

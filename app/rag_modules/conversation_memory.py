@@ -10,6 +10,8 @@ import logging
 import os
 import time
 import hashlib
+import json
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
@@ -55,6 +57,14 @@ class ConversationMemory:
         self._collection_ready = False
         self._neo4j_ready = False
         self._pending_flush: List[ConversationTurn] = []
+        self._summary_done = False
+
+        # WAL（Write-Ahead Log）：崩溃恢复
+        self._wal_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", ".memory_wal.jsonl"
+        )
+        self._recover_from_wal()
 
     def initialize(self):
         """初始化记忆模块：连接 Neo4j，创建 Milvus 集合"""
@@ -133,6 +143,7 @@ class ConversationMemory:
         session_id = f"sess_{int(time.time())}_{hashlib.md5(str(time.time()).encode()).hexdigest()[:6]}"
         self.buffer.clear()
         self._pending_flush.clear()
+        self._summary_done = False
 
         if self._neo4j_ready and self.driver:
             try:
@@ -152,6 +163,7 @@ class ConversationMemory:
             self._flush_to_neo4j(self._pending_flush)
             self._flush_to_milvus(self._pending_flush)
             self._pending_flush.clear()
+            self._wal_clear()
 
         if self._neo4j_ready and self.driver:
             try:
@@ -164,6 +176,71 @@ class ConversationMemory:
                 logger.warning(f"关闭 Neo4j 会话失败: {e}")
 
         logger.info(f"临床会话已关闭: {session_id}")
+
+    # ==================== Write-Ahead Log (崩溃恢复) ====================
+
+    def _wal_append(self, turn: ConversationTurn):
+        """将未刷新的轮次写入 WAL 文件，系统崩溃后可恢复"""
+        try:
+            os.makedirs(os.path.dirname(self._wal_path), exist_ok=True)
+            with open(self._wal_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps({
+                    "turn_id": turn.turn_id,
+                    "session_id": turn.session_id,
+                    "turn_index": turn.turn_index,
+                    "question": turn.question,
+                    "answer": turn.answer,
+                    "strategy": turn.strategy,
+                    "timestamp": turn.timestamp,
+                    "complexity_score": turn.complexity_score,
+                    "disease_entities": turn.disease_entities,
+                    "department": turn.department,
+                }, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logger.warning(f"WAL 写入失败: {e}")
+
+    def _wal_clear(self):
+        """成功刷新后清空 WAL"""
+        try:
+            if os.path.exists(self._wal_path):
+                os.remove(self._wal_path)
+        except Exception as e:
+            logger.warning(f"WAL 清理失败: {e}")
+
+    def _recover_from_wal(self):
+        """启动时检查 WAL，恢复未刷新的数据"""
+        if not os.path.exists(self._wal_path):
+            return
+        try:
+            recovered = []
+            with open(self._wal_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    turn = ConversationTurn(
+                        turn_id=data["turn_id"],
+                        session_id=data["session_id"],
+                        turn_index=data["turn_index"],
+                        question=data["question"],
+                        answer=data["answer"],
+                        strategy=data["strategy"],
+                        timestamp=data["timestamp"],
+                        complexity_score=data.get("complexity_score", 0.0),
+                        disease_entities=data.get("disease_entities", []),
+                        department=data.get("department", ""),
+                    )
+                    recovered.append(turn)
+
+            if recovered:
+                logger.info(f"WAL 中发现 {len(recovered)} 条未刷新的记忆，正在恢复...")
+                self._flush_to_neo4j(recovered)
+                self._flush_to_milvus(recovered)
+                self._wal_clear()
+                logger.info(f"WAL 恢复完成")
+        except Exception as e:
+            logger.warning(f"WAL 恢复失败: {e}")
 
     # ==================== Memory Recording ====================
 
@@ -195,13 +272,18 @@ class ConversationMemory:
         self.buffer.append(turn)
         self._pending_flush.append(turn)
 
+        # 写入 WAL（崩溃后可恢复）
+        self._wal_append(turn)
+
         if len(self._pending_flush) >= self.config.memory_batch_flush_size:
             self._flush_to_neo4j(self._pending_flush)
             self._flush_to_milvus(self._pending_flush)
             self._pending_flush.clear()
+            self._wal_clear()
 
-        if len(self.buffer) >= self.config.memory_summary_threshold:
+        if not self._summary_done and len(self.buffer) >= self.config.memory_summary_threshold:
             self._summarize_buffer(session_id)
+            self._summary_done = True
 
     def _flush_to_neo4j(self, turns: List[ConversationTurn]):
         if not self._neo4j_ready or not self.driver:
@@ -348,29 +430,87 @@ class ConversationMemory:
     # ==================== Memory Retrieval ====================
 
     def retrieve_memory_context(self, question: str, session_id: str) -> str:
+        """
+        多源记忆融合检索（修复版）
+
+        修复内容：
+        1. 每个来源带优先级标注和时间戳，帮助 LLM 区分可信度
+        2. 按重要性顺序拼接（短期缓冲 > 图谱摘要 > 语义回忆），重要内容不被截断
+        3. 截断在完整句子/实体边界处，避免切碎关键信息
+        """
         if not self.config.memory_enabled:
             return ""
 
         parts = []
 
+        # 按可靠性降序排列：缓冲 > 图谱 > 语义
         recent = self._format_buffer_context()
         if recent:
-            parts.append(recent)
-
-        similar = self._semantic_recall(question, session_id)
-        if similar:
-            parts.append(similar)
+            parts.append(("buffer", recent))
 
         graph_ctx = self._graph_recall(session_id)
         if graph_ctx:
-            parts.append(graph_ctx)
+            parts.append(("graph", graph_ctx))
 
-        full_context = "\n\n".join(parts)
+        similar = self._semantic_recall(question, session_id)
+        if similar:
+            parts.append(("semantic", similar))
+
+        if not parts:
+            return ""
+
+        # 按优先级拼接（缓冲最重要，优先完整保留）
+        full_context = ""
         max_chars = self.config.memory_max_context_chars
-        if len(full_context) > max_chars:
-            full_context = full_context[:max_chars] + "\n[...记忆上下文已截断]"
+        remaining = max_chars
+
+        for source_type, content in parts:
+            header = f"[来源: {source_type}]"
+            if source_type == "buffer":
+                source_note = "（当前会话记录，高可靠性）"
+            elif source_type == "graph":
+                source_note = "（当前会话图谱摘要）"
+            else:
+                source_note = "（历史相似病例，跨会话参考，可靠性较低）"
+
+            section = f"{header}{source_note}\n{content}\n\n"
+
+            if len(section) <= remaining:
+                full_context += section
+                remaining -= len(section)
+            else:
+                # 剩余空间不足时，智能截断（保留完整句子）
+                available = remaining - len(header) - len(source_note) - 4  # -\n\n
+                if available > 50:
+                    truncated = self._smart_truncate(content, available)
+                    section = f"{header}{source_note}\n{truncated}\n\n[该部分因长度限制被截断]\n\n"
+                    full_context += section
+                remaining = 0
+                break
 
         return full_context
+
+    def _smart_truncate(self, text: str, max_chars: int) -> str:
+        """在完整句子边界截断，避免切碎关键信息"""
+        if len(text) <= max_chars:
+            return text
+
+        # 尝试在句号、问号、感叹号处截断
+        truncated = text[:max_chars]
+        # 从后往前找句子结束符
+        for sep in ['。', '？', '！', '\n']:
+            last_sep = truncated.rfind(sep)
+            if last_sep > max_chars * 0.6:  # 确保截断点不会太靠前
+                return truncated[:last_sep + 1] + "\n[...截断]"
+
+        # 如果没有完整句子边界，在完整单词/词语边界截断
+        for sep in [' ', '，', '；']:
+            last_sep = truncated.rfind(sep)
+            if last_sep > max_chars * 0.7:
+                return truncated[:last_sep] + "\n[...截断]"
+
+        # 最后兜底：在字符边界截断
+        return truncated.rstrip() + "\n[...截断]"
 
     def _format_buffer_context(self) -> str:
         if not self.buffer:
@@ -437,41 +577,91 @@ class ConversationMemory:
             return ""
 
     def _graph_recall(self, session_id: str) -> str:
+        """
+        图记忆召回（修复版）
+
+        原实现只返回聚合计数和疾病名列表，不包含任何图谱结构信息。
+        修复后：
+        - 返回当前会话中的实际图谱路径和关系
+        - 包含疾病-科室关联、疾病-疾病共现路径
+        - 对最近一轮对话建立实体关联推理链
+        """
         if not self._neo4j_ready or not self.driver:
             return ""
 
         try:
+            lines = ["【当前会话图谱结构】"]
             with self.driver.session() as s:
-                result = s.run(
+                # 1. 获取本轮对话涉及的实体关系和路径
+                #    从 Turn 节点出发，通过 REFERENCES_DISEASE / REFERENCES_DEPT 找到实体
+                path_result = s.run(
                     """
                     MATCH (ses:Session {session_id: $sid})-[:CONTAINS]->(t:Turn)
                     OPTIONAL MATCH (t)-[:REFERENCES_DISEASE]->(d:Disease)
-                    WITH t, collect(DISTINCT d.name) AS diseases
-                    RETURN t.question AS question, t.answer AS answer,
-                           t.strategy AS strategy, diseases
+                    OPTIONAL MATCH (t)-[:REFERENCES_DEPT]->(dept:Department)
+                    WITH t, collect(DISTINCT d.name) AS diseases, collect(DISTINCT dept.name) AS departments
+                    RETURN t.turn_index AS idx, t.question AS question,
+                           t.strategy AS strategy, diseases, departments,
+                           t.complexity_score AS complexity
                     ORDER BY t.turn_index
+                    LIMIT 10
                     """,
                     sid=session_id,
                 )
-
-                records = list(result)
+                records = list(path_result)
                 if not records:
                     return ""
 
+                # 2. 构建轮次间的推理路径
                 all_diseases = set()
+                prev_diseases = set()
                 for r in records:
-                    for d in r.get("diseases", []) or []:
-                        all_diseases.add(d)
+                    diseases = set(r.get("diseases", []) or [])
+                    depts = set(r.get("departments", []) or [])
+                    idx = r["idx"]
+                    question = r["question"][:80]
 
-                strategies = set(r.get("strategy", "") for r in records if r.get("strategy"))
+                    reasoning_link = ""
+                    # 检测与前一轮的疾病关系
+                    new_diseases = diseases - prev_diseases
+                    continued_diseases = diseases & prev_diseases
+                    if continued_diseases:
+                        reasoning_link = f"（延续前轮疾病: {', '.join(continued_diseases)}）"
+                    if new_diseases:
+                        reasoning_link += f"（新增: {', '.join(new_diseases)}）"
 
-                lines = [
-                    "【会话图谱摘要】",
-                    f"本轮会话已讨论 {len(records)} 个问题",
-                    f"涉及疾病: {', '.join(all_diseases) if all_diseases else '暂无'}",
-                    f"使用检索策略: {', '.join(strategies) if strategies else '暂无'}",
-                ]
-                return "\n".join(lines)
+                    dept_str = f" | 科室: {', '.join(depts)}" if depts else ""
+                    lines.append(f"  - 第{idx + 1}轮: {question}{dept_str}{reasoning_link}")
+                    all_diseases.update(diseases)
+                    prev_diseases = diseases
+
+                # 3. 构建疾病共现路径（从本轮会话中挖掘）
+                if len(all_diseases) >= 2:
+                    # 查找疾病之间通过 Turn 节点的共现路径
+                    path_rels = s.run(
+                        """
+                        MATCH (ses:Session {session_id: $sid})-[:CONTAINS]->(t:Turn)
+                        MATCH (t)-[:REFERENCES_DISEASE]->(d1:Disease)
+                        MATCH (t)-[:REFERENCES_DISEASE]->(d2:Disease)
+                        WHERE d1.name < d2.name
+                        WITH d1, d2, collect(t.turn_index) AS co_turns
+                        RETURN d1.name AS disease_a, d2.name AS disease_b,
+                               size(co_turns) AS co_occurrence_count
+                        ORDER BY co_occurrence_count DESC
+                        LIMIT 5
+                        """
+                    )
+                    path_rels_list = list(path_rels)
+                    if path_rels_list:
+                        lines.append("  📎 疾病共现关系（同一轮讨论的疾病对，提示潜在并发症/关联）:")
+                        for pr in path_rels_list:
+                            lines.append(f"    - {pr['disease_a']} ↔ {pr['disease_b']} "
+                                         f"（共现 {pr['co_occurrence_count']} 次）")
+
+                # 4. 汇总
+                lines.insert(1, f"  共 {len(records)} 轮对话 | 涉及 {len(all_diseases)} 种疾病")
+
+            return "\n".join(lines)
 
         except Exception as e:
             logger.warning(f"图记忆召回失败: {e}")
@@ -541,4 +731,5 @@ class ConversationMemory:
             self._flush_to_neo4j(self._pending_flush)
             self._flush_to_milvus(self._pending_flush)
             self._pending_flush.clear()
+            self._wal_clear()
         logger.info("记忆模块已关闭")

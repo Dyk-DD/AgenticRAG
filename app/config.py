@@ -29,6 +29,13 @@ class GraphRAGConfig:
 
     # === 模型配置 ===
     embedding_model: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "bge-base-zh-v1.5")
+    embedding_dimension: int = 768  # bge-base-zh-v1.5=768, BGE-M3=1024
+    #
+    # 如需切换至 BGE-M3（需手动下载完整权重 2.27GB）：
+    #   1. 设置 embedding_model = "models/bge-m3"
+    #   2. 设置 embedding_dimension = 1024
+    #   3. 删除 Milvus 集合重建索引（维度不兼容）
+    #
     llm_model: str = "deepseek-v4-flash"
 
     # === 检索配置（Round-robin策略） ===

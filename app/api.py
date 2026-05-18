@@ -4,10 +4,12 @@ Provides REST + SSE endpoints for the React frontend.
 """
 
 import asyncio
+import collections
 import json
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -22,10 +24,43 @@ from pydantic import BaseModel
 from main import ClinicalDecisionSystem
 from qa_database import QADatabase
 
-load_dotenv(override=True)
+# 加载 .env：优先找 app/.env，没找到则找项目根目录的 .env
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+if not os.path.exists(_env_path):
+    _env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+load_dotenv(_env_path, override=True)
 logger = logging.getLogger(__name__)
 
 ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "")
+
+# ── Rate limiter (in-memory sliding window) ──────────────────────────
+
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX = 30     # max requests per window
+
+
+class RateLimiter:
+    def __init__(self):
+        self._windows: dict[str, collections.deque] = {}
+
+    def check(self, key: str) -> bool:
+        now = time.time()
+        window = self._windows.get(key)
+        if window is None:
+            self._windows[key] = collections.deque([now])
+            return True
+        # 滑动窗口：移除超出时间窗口的记录
+        while window and window[0] < now - RATE_LIMIT_WINDOW:
+            window.popleft()
+        if len(window) >= RATE_LIMIT_MAX:
+            return False
+        window.append(now)
+        return True
+
+
+_rate_limiter = RateLimiter()
+
+# ── App ──────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Agentic-RAG API", version="1.0")
 
@@ -52,8 +87,15 @@ async def auth_middleware(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         return await call_next(request)
 
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not _rate_limiter.check(client_ip):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "请求过于频繁，请稍后再试"}
+        )
+
     if not ACCESS_PASSWORD:
-        # No password configured → allow all (backward compatible)
         return await call_next(request)
 
     auth_header = request.headers.get("Authorization", "")
@@ -78,24 +120,27 @@ async def auth_login(req: Request):
 
 _rag: Optional[ClinicalDecisionSystem] = None
 _qa_db: Optional[QADatabase] = None
+_init_lock = threading.Lock()
 
 
 def get_rag() -> ClinicalDecisionSystem:
     global _rag
     if _rag is None:
-        logger.info("Initializing ClinicalDecisionSystem...")
-        try:
-            rag = ClinicalDecisionSystem()
-            rag.initialize_system()
-            rag.build_knowledge_base()
-            _rag = rag
-            # Sync SQLite session
-            if _rag.current_session_id:
-                get_qa_db().create_session(_rag.current_session_id)
-            logger.info("ClinicalDecisionSystem ready")
-        except Exception as e:
-            logger.error(f"System initialization failed: {e}", exc_info=True)
-            raise HTTPException(status_code=503, detail=f"系统初始化失败: {e}")
+        with _init_lock:
+            if _rag is None:  # double-check
+                logger.info("Initializing ClinicalDecisionSystem...")
+                try:
+                    rag = ClinicalDecisionSystem()
+                    rag.initialize_system()
+                    rag.build_knowledge_base()
+                    _rag = rag
+                    # Sync SQLite session
+                    if _rag.current_session_id:
+                        get_qa_db().create_session(_rag.current_session_id)
+                    logger.info("ClinicalDecisionSystem ready")
+                except Exception as e:
+                    logger.error(f"System initialization failed: {e}", exc_info=True)
+                    raise HTTPException(status_code=503, detail=f"系统初始化失败: {e}")
     return _rag
 
 
@@ -432,12 +477,29 @@ def get_stats():
     return stats
 
 
+# ── Startup event ──────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    """服务器启动时初始化 RAG 系统，初始化完成后再接受请求"""
+    logger.info("正在初始化 ClinicalDecisionSystem，请稍候...")
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, get_rag)
+        logger.info("ClinicalDecisionSystem 初始化完毕，服务器就绪")
+    except Exception as e:
+        logger.error(f"ClinicalDecisionSystem 初始化失败: {e}")
+        logger.error("请检查: 1) Neo4j 是否运行  2) Milvus 是否运行  3) .env 配置是否正确")
+
+
 # ── Health check ──────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health():
-    rag = get_rag()
+    rag = _rag
+    if rag is None:
+        return {"status": "initializing", "session_id": ""}
     return {
         "status": "ok" if rag.system_ready else "initializing",
-        "session_id": rag.current_session_id,
+        "session_id": rag.current_session_id or "",
     }

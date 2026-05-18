@@ -3,7 +3,9 @@
 所有清洗工作在 data/cleaning/ 下独立进行，不影响 data/processed/ 的 RAG 索引。
 完成后手动将最终 CSV 复制到 data/processed/ 即可。
 
-用法: python scripts/clean_and_generate_qa.py
+用法: 
+  python scripts/clean_and_generate_qa.py          # 执行阶段一和阶段二
+  python scripts/clean_and_generate_qa.py --skip-clean  # 跳过阶段一，只执行阶段二
 """
 
 import csv
@@ -32,7 +34,7 @@ COLUMNS = ["department", "title", "ask", "answer"]
 
 MODEL = "deepseek-chat"
 MAX_RETRIES = 3
-GENERATE_COUNT = 1000
+GENERATE_COUNT = 7000
 
 # ── 提示词 ──────────────────────────────────────────
 
@@ -52,12 +54,18 @@ CLEAN_PROMPT = """你是一个医疗数据清洗专家。请对以下医疗问�
 9. 回答中严禁使用任何换行符（\\n），所有内容必须写成一个连续段落。用"；"或"。"连接各个要点，不得使用编号列表。
 
 请严格按以下格式输出（不要加任何额外说明和序号）：
-[DEPARTMENT]{department}[/DEPARTMENT]
-[TITLE]{title}[/TITLE]
-[ASK]{ask}[/ASK]
-[ANSWER]{answer}[/ANSWER]
+[DEPARTMENT]{{department}}[/DEPARTMENT]
+[TITLE]{{title}}[/TITLE]
+[ASK]{{ask}}[/ASK]
+[ANSWER]{{answer}}[/ANSWER]
 
-注意：[/ANSWER] 标记必须在回答完全结束后输出，确保回答内容完整。"""
+注意：[/ANSWER] 标记必须在回答完全结束后输出，确保回答内容完整。
+
+【待清洗数据】
+科室: {department}
+标题: {title}
+问题: {ask}
+回答: {answer}"""
 
 
 CRITICAL_DEPT_PROMPT = """你是一位拥有20年临床经验的重症医学科主任医师。请为以下重症科室生成真实的医疗问答对：
@@ -108,7 +116,7 @@ def call_deepseek(client: OpenAI, prompt: str, model: str = MODEL, max_tokens: i
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=max_tokens,
-                timeout=120,
+                timeout=300,
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:
@@ -151,6 +159,16 @@ def count_output_rows(path: Path) -> int:
         reader = csv.reader(f)
         rows = list(reader)
     return max(0, len(rows) - 1)  # 减去表头行
+
+
+def ensure_output_file_exists(output_path: Path):
+    """确保输出文件存在且有表头"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not output_path.exists():
+        with open(output_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(COLUMNS)
+        print(f"创建输出文件: {output_path}")
 
 
 def clean_csv(client: OpenAI, input_path: Path, output_path: Path):
@@ -240,6 +258,9 @@ def clean_csv(client: OpenAI, input_path: Path, output_path: Path):
 
 def generate_critical_qa(client: OpenAI, output_path: Path, count: int = GENERATE_COUNT):
     """生成重症科室的问答对，追加到文件末尾，支持断点续传"""
+    # 确保输出文件存在
+    ensure_output_file_exists(output_path)
+    
     # ── 断点检测：统计输出文件中已有的数据行 ──
     existing_total = count_output_rows(output_path) if output_path.exists() else 0
     if existing_total >= count:
@@ -250,7 +271,7 @@ def generate_critical_qa(client: OpenAI, output_path: Path, count: int = GENERAT
     print(f"生成目标: {count} 条, 已生成: {existing_total} 条, 待生成: {count - existing_total} 条\n")
 
     generated = 0
-    batch_size = 50
+    batch_size = 2
     remaining = count - existing_total
     total_requests = (remaining + batch_size - 1) // batch_size
 
@@ -258,8 +279,10 @@ def generate_critical_qa(client: OpenAI, output_path: Path, count: int = GENERAT
         batch_count = min(batch_size, remaining - generated)
         batch_prompt = CRITICAL_DEPT_PROMPT.format(count=batch_count)
 
+        print(f"  ⏳ 批次 {batch_idx + 1}/{total_requests}: 请求 API 生成 {batch_count} 条 (累计 {existing_total + generated}/{count})...", flush=True)
+
         try:
-            raw = call_deepseek(client, batch_prompt, max_tokens=16000)
+            raw = call_deepseek(client, batch_prompt, max_tokens=8192)
 
             lines = raw.strip().split("\n")
             batch_added = 0
@@ -289,9 +312,30 @@ def generate_critical_qa(client: OpenAI, output_path: Path, count: int = GENERAT
     print(f"\n生成完成: 本批 {generated} 条, 累计 {existing_total + generated} 条")
 
 
+def copy_to_processed():
+    """复制最终文件到 processed 目录"""
+    if OUTPUT_FILE.exists():
+        print(f"\n{'='*60}")
+        print(f"复制最终文件到 RAG 索引目录...")
+        shutil.copy2(str(OUTPUT_FILE), str(FINAL_FILE))
+        print(f"  {OUTPUT_FILE}")
+        print(f"  → {FINAL_FILE}")
+    else:
+        print(f"\n⚠️ 警告: 输出文件 {OUTPUT_FILE} 不存在，跳过复制")
+
+
 # ── 主流程 ────────────────────────────────────────
 
 def main():
+    # 解析命令行参数
+    skip_clean = "--skip-clean" in sys.argv
+    
+    if skip_clean:
+        print("⚠️  跳过阶段一（数据清洗），仅执行阶段二（生成重症问答对）\n")
+    else:
+        print("✓ 执行完整流程（阶段一 + 阶段二）\n")
+        print("提示：使用 'python scripts/clean_and_generate_qa.py --skip-clean' 可跳过清洗阶段\n")
+    
     # 如果 data/processed/ 下有旧的中间产物，迁移到 cleaning 目录
     old_output = PROCESSED_DIR / "cleaned_内科_plus_重症.csv"
     if old_output.exists() and not OUTPUT_FILE.exists():
@@ -302,13 +346,26 @@ def main():
 
     client = init_client()
 
-    print("=" * 60)
-    print("阶段一：清洗原始问答数据")
-    print(f"  输入: {INPUT_FILE}")
-    print(f"  输出: {OUTPUT_FILE}")
-    print("=" * 60)
-    clean_csv(client, INPUT_FILE, OUTPUT_FILE)
+    if not skip_clean:
+        # 阶段一：清洗原始问答数据
+        print("=" * 60)
+        print("阶段一：清洗原始问答数据")
+        print(f"  输入: {INPUT_FILE}")
+        print(f"  输出: {OUTPUT_FILE}")
+        print("=" * 60)
+        
+        if not INPUT_FILE.exists():
+            print(f"⚠️ 错误: 输入文件不存在: {INPUT_FILE}")
+            print("请确认文件路径是否正确，或使用 --skip-clean 跳过此阶段")
+            sys.exit(1)
+            
+        clean_csv(client, INPUT_FILE, OUTPUT_FILE)
+    else:
+        print("阶段一已跳过")
+        # 确保输出文件存在（供阶段二使用）
+        ensure_output_file_exists(OUTPUT_FILE)
 
+    # 阶段二：生成重症科室问答对
     print(f"\n{'=' * 60}")
     print("阶段二：生成重症科室问答对")
     print(f"  输出: {OUTPUT_FILE}")
@@ -316,11 +373,8 @@ def main():
     generate_critical_qa(client, OUTPUT_FILE, GENERATE_COUNT)
 
     # 完成后复制到 data/processed/ 供 RAG 索引
-    print(f"\n{'=' * 60}")
-    print(f"复制最终文件到 RAG 索引目录...")
-    shutil.copy2(str(OUTPUT_FILE), str(FINAL_FILE))
-    print(f"  {OUTPUT_FILE}")
-    print(f"  → {FINAL_FILE}")
+    copy_to_processed()
+    
     print(f"\n全部完成！可以重启 RAG 后端索引新数据。")
 
 
