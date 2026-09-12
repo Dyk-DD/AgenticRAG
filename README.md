@@ -335,10 +335,74 @@ docker run --rm -v agentic-rag_rag_state:/src -v "$PWD/data:/dst" alpine \
 ### 5. 本机验证（不走隧道）
 
 容器内已经同时提供前端和 API，直接开 `http://localhost:8000` 走完整流程即可。
-`api` 容器默认不发布端口，本机调试时在 `docker-compose.yml` 里临时加上
-`ports: ["127.0.0.1:8000:8000"]`；**不要绑到 `0.0.0.0`**——限流依赖
-`cf-connecting-ip` 头，端口一旦对别的来源可达，该头就能被伪造，等于绕过
-`/api/auth` 的暴破防护。
+
+#### 5.1 先发布端口
+
+`api` 容器默认不发布端口。在仓库根目录新建 `docker-compose.override.yml`：
+
+```yaml
+services:
+  api:
+    ports:
+      - "127.0.0.1:8000:8000"
+```
+
+`docker compose` 会自动读取并叠加这个文件。**改这里而不是改
+`docker-compose.yml`**：override 文件已在 `.gitignore` 里，不进版本控制，
+`git pull` 时不会冲突。
+
+然后 `docker compose up -d api` 生效。注意这会**重建 api 容器**，容器内的嵌入
+模型要重新加载，公网站点在此期间不可用；挑个没人用的时候做。
+撤销：删掉该文件再 `docker compose up -d api`。
+
+**不要绑到 `0.0.0.0`**——限流依赖 `cf-connecting-ip` 头，端口一旦对别的来源
+可达，该头就能被伪造，等于绕过 `/api/auth` 的暴破防护。
+
+#### 5.2 前端本地开发
+
+前端产物是**只读挂载**（`./frontend/dist:/app/static:ro`），从不打进镜像——
+所以改前端**永远不需要重建镜像**，也不必绕公网：
+
+| 目的             | 命令                           | 生效方式                                    |
+| ---------------- | ------------------------------ | ------------------------------------------- |
+| 改设计（热更新） | `cd frontend && npm run dev`   | `http://localhost:5173`，保存即刷新         |
+| 验证产物         | `cd frontend && npm run build` | dist 实时挂载，刷新页面即可，容器都不用重启 |
+
+热更新模式依赖 5.1 那步：`app/api/config.ts` 在 DEV 下让 API 走相对路径，
+由 Vite 代理转发到 `127.0.0.1:8000`，端口没发布就会得到 502。
+
+在 VSCode 里 **Open Folder 直接打开 `frontend/`**，不要开仓库根目录——它有自己的
+`package.json` / `tsconfig` / `eslint.config.js`，开根目录会让 TS 服务按后端那套
+配置解析，飘一堆假报错。
+
+#### 5.3 跑评测
+
+`scripts/local_test.sh` 把「拷脚本进容器 → 跑评测 → 清测试数据」封成一条命令：
+
+```bash
+./scripts/local_test.sh                 # 导入检查 + 检索/路由评测(20条) + 清数据
+./scripts/local_test.sh --full          # 加 generation/e2e + LLM Judge（慢、花钱）
+./scripts/local_test.sh --smoke         # 只导入检查，不花 LLM 钱
+./scripts/local_test.sh --sample 50     # 换采样条数
+./scripts/local_test.sh --no-clean      # 跑完不清数据
+./scripts/local_test.sh --clean-only    # 跳过检查与评测，只清数据
+./scripts/local_test.sh --dry-run       # 只统计待删记录数，不做任何删除
+```
+
+输出实时流式，同时留档到 `scripts/.local_test_last.log`。评测会把患者/会话/问答
+写进 SQLite，默认跑完自动清掉（只动 `qa_history.db`，不碰 Milvus 与 Neo4j）。
+
+脚本内部处理了两件必须做对的事：`scripts/` 在 `.dockerignore` 里（镜像中没有）
+所以要先 `docker cp` 进容器，且落点必须是 `/app/scripts/` —— `evaluate.py` 用
+`__file__` 反推项目根，放 `/tmp` 会 import 不到 `app.*`；Git Bash 下还要
+`MSYS_NO_PATHCONV=1`，否则容器路径会被改写成 Windows 路径。
+
+> **测试集必须与知识库同源**，否则检索指标恒为 0：ground truth 的 node_id 由
+> `md5(科室_标题_问_答)` 算出，拿别的科室的 CSV 当测试集一条都匹配不上。
+> 用 `scripts/strategy_comparison/sample_testset.py` 采样、
+> `label_routing_ground_truth.py` 标注路由 ground truth 生成。
+> 直接跑公网 `https://www.yankandou.com` 做人工验收也可以，但只有这条路能出
+> 可量化的指标。
 
 ## 项目结构
 

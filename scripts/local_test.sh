@@ -12,7 +12,8 @@
 #    ./scripts/local_test.sh --full          # 额外跑 generation/e2e + LLM Judge（慢、花钱）
 #    ./scripts/local_test.sh --sample 50     # 换采样条数
 #    ./scripts/local_test.sh --no-clean      # 跑完不清数据（想留证据时）
-#    ./scripts/local_test.sh --clean-only    # 只清数据
+#    ./scripts/local_test.sh --clean-only    # 跳过检查与评测，只清数据
+#    ./scripts/local_test.sh --dry-run       # 只统计待删记录数，不做任何删除
 #    ./scripts/local_test.sh --smoke         # 只做导入检查（不花 LLM 钱，改完评测模块先跑这个）
 #    ./scripts/local_test.sh --help
 #
@@ -45,6 +46,7 @@ DO_SMOKE=1
 DO_EVAL=1
 DO_CLEAN=1
 CLEAN_ONLY=0
+DRY_CLEAN=0
 TESTSET="$DEFAULT_TESTSET"
 EXTRA_ARGS=()
 
@@ -67,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --full)       STAGES="retrieval routing generation e2e"; LLM_JUDGE="--llm-judge" ;;
     --smoke)      DO_SMOKE=1; DO_EVAL=0; DO_CLEAN=0 ;;
     --clean-only) DO_SMOKE=0; DO_EVAL=0; CLEAN_ONLY=1 ;;
+    --dry-run)    DRY_CLEAN=1 ;;
     --no-clean)   DO_CLEAN=0 ;;
     --sample)     SAMPLES="$2"; shift ;;
     --stages)     STAGES="$2"; shift ;;
@@ -161,8 +164,11 @@ fi
 # ---- 3. 清数据 ---------------------------------------------------------------
 if [[ "$CLEAN_ONLY" == "1" || "$DO_CLEAN" == "1" ]]; then
   step "3/3 清空测试数据（只动 qa_history.db，不碰 Milvus / Neo4j）"
+  # --clean-only 是「只做清理这一步」，所以它要真的删；想先看看有多少条用
+  # --dry-run。早先这里写成 CLEAN_ONLY -> --dry-run，于是 --clean-only 什么
+  # 都不删，而帮助文本写着「只清数据」—— 名字和行为对不上。
   CLEAN_FLAGS=(--yes)
-  [[ "$CLEAN_ONLY" == "1" ]] && CLEAN_FLAGS=(--dry-run)
+  [[ "$DRY_CLEAN" == "1" ]] && CLEAN_FLAGS=(--dry-run)
   docker compose exec -T -e PYTHONIOENCODING=utf-8 \
     "$COMPOSE_SVC" python "${CTR_SCRIPTS}/clear_test_data.py" "${CLEAN_FLAGS[@]}" 2>&1 | tail -16
 fi
