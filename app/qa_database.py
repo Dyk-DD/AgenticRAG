@@ -1,7 +1,10 @@
 """SQLite-based Q&A persistence, independent of Neo4j/Milvus."""
 
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -10,6 +13,21 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent.parent / "data" / "qa_history.db"
+
+# 访问码存储参数
+PBKDF2_ROUNDS = 100_000
+ACCESS_CODE_DIGITS = 6
+
+
+def hash_access_code(code: str, salt: str) -> str:
+    """PBKDF2-HMAC-SHA256 派生访问码哈希，返回十六进制字符串。"""
+    return hashlib.pbkdf2_hmac(
+        "sha256", code.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ROUNDS
+    ).hex()
+
+
+def generate_access_code() -> str:
+    return f"{secrets.randbelow(10 ** ACCESS_CODE_DIGITS):0{ACCESS_CODE_DIGITS}d}"
 
 
 class QADatabase:
@@ -70,18 +88,52 @@ class QADatabase:
                 except sqlite3.OperationalError:
                     pass
 
+            # 访问码改哈希存储（access_code 列保留但不再写入明文）
+            for col in ("access_salt", "access_hash"):
+                try:
+                    conn.execute(f"ALTER TABLE patients ADD COLUMN {col} TEXT DEFAULT ''")
+                except sqlite3.OperationalError:
+                    pass
+
+            # 一次性清理：哈希机制上线前的旧患者记录 access_hash 为空，而它们的
+            # access_code 是明文且多为空串——空码对空码即通过校验，等同于后门。
+            # 这类记录无法安全迁移（原文可能为空），连同其会话与问答一并删除，
+            # 需要用户重新注册。新注册的记录 access_hash 非空，故本清理幂等。
+            legacy_ids = [
+                r["id"] for r in conn.execute(
+                    "SELECT id FROM patients WHERE COALESCE(access_hash, '') = ''"
+                ).fetchall()
+            ]
+            for pid in legacy_ids:
+                conn.execute("DELETE FROM qa_records WHERE client_id = ?", (pid,))
+                conn.execute("DELETE FROM sessions WHERE client_id = ?", (pid,))
+                conn.execute("DELETE FROM patients WHERE id = ?", (pid,))
+            if legacy_ids:
+                logger.warning(
+                    f"已清理 {len(legacy_ids)} 条无访问码哈希的旧患者记录及其会话数据，"
+                    f"这些身份需要重新注册"
+                )
+
     # ── Patient management ──────────────────────────────────────────
 
     def register_patient(self, name: str, access_code: str = "") -> dict:
-        import hashlib
+        """注册患者。未提供访问码时由服务端生成一个，并只在本次响应中明文返回。
+
+        库中仅保存 PBKDF2 哈希与随机 salt，明文不落盘。
+        """
         pid = "p_" + hashlib.md5(f"{name}{time.time()}".encode()).hexdigest()[:8]
+        code = access_code.strip() or generate_access_code()
+        salt = secrets.token_hex(16)
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO patients (id, name, access_code, created_at) VALUES (?, ?, ?, ?)",
-                (pid, name, access_code, time.strftime("%Y-%m-%dT%H:%M:%S")),
+                "INSERT INTO patients (id, name, access_code, access_salt, access_hash, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (pid, name, "", salt, hash_access_code(code, salt),
+                 time.strftime("%Y-%m-%dT%H:%M:%S")),
             )
         logger.info(f"Patient registered: {pid} ({name})")
-        return {"patient_id": pid, "name": name}
+        # access_code 是唯一一次可读到明文的时机，调用方需提示用户保存
+        return {"patient_id": pid, "name": name, "access_code": code}
 
     def list_patients(self) -> list[dict]:
         with self._connect() as conn:
@@ -91,14 +143,28 @@ class QADatabase:
         return [{"patient_id": r["id"], "name": r["name"], "created_at": r["created_at"]} for r in rows]
 
     def verify_patient(self, patient_id: str, access_code: str = "") -> Optional[dict]:
+        """校验患者身份。访问码为空一律拒绝，不做哈希比对。
+
+        此前是 ``WHERE id = ? AND access_code = ?`` 的明文比对，注册时若留空，
+        空码对空码即通过，配合公开的患者列表等于任意接管。现在强制非空，
+        且用 compare_digest 定时安全比较。
+        """
+        if not access_code.strip():
+            return None
+
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT id, name FROM patients WHERE id = ? AND access_code = ?",
-                (patient_id, access_code),
+                "SELECT id, name, access_salt, access_hash FROM patients WHERE id = ?",
+                (patient_id,),
             ).fetchone()
-        if row:
-            return {"patient_id": row["id"], "name": row["name"]}
-        return None
+
+        if not row or not row["access_hash"]:
+            return None
+
+        expected = hash_access_code(access_code.strip(), row["access_salt"])
+        if not hmac.compare_digest(expected, row["access_hash"]):
+            return None
+        return {"patient_id": row["id"], "name": row["name"]}
 
     # ── Session management ──────────────────────────────────────────
 

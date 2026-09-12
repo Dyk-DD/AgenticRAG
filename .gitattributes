@@ -1,0 +1,7 @@
+# 仓库此前没有 .gitattributes 且 core.autocrlf=true，任何新增的 .sh 都会以
+# CRLF 检出，在 Linux 容器里 exec 时报 `bad interpreter: /bin/sh^M`。
+#
+# 这里只约束 shell 脚本，不加 `* text=auto`：那会让 git 在下一次 git add 时
+# 重写索引里所有文本文件的换行符，产生一个横跨整个仓库的巨大 diff。
+*.sh text eol=lf
+*.bash text eol=lf

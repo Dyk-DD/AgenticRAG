@@ -1,0 +1,30 @@
+# 没有这个文件时构建上下文约 6.8GB（models 5.1G + data + volumes + frontend/node_modules），
+# 每次构建都要整个推给 daemon。
+
+.git
+.gitignore
+.idea
+.vscode
+
+# 真实密钥绝不能进镜像：app/api.py 与 app/main.py 都是 load_dotenv(override=True)
+# （文件覆盖进程环境变量），镜像里若有一份陈旧 .env，会静默压掉 compose 注入的
+# ACCESS_PASSWORD / SECRET_KEY / DEEPSEEK_API_KEY。
+.env
+.env.*
+
+models/
+volumes/
+data/
+docs/
+scripts/
+
+# 整个前端目录都不进构建上下文。Dockerfile 不 COPY 任何前端文件——
+# SPA 产物是在运行时以只读卷挂载到 /app/static 的（见 docker-compose.yml），
+# 所以镜像里不需要它。这同时避免了"dist 会不会被忽略规则误伤"的歧义。
+frontend/
+
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.log
+README.md

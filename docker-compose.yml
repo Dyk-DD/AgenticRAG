@@ -16,16 +16,18 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+    restart: unless-stopped
 
   minio:
     container_name: milvus-minio
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
     ports:
-      - "9050:9000"
-      - "9090:9090"
+      # 仅绑定回环：后端跑在宿主机上，数据库不需要对局域网/公网开放
+      - "127.0.0.1:9050:9000"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./volumes/minio:/minio_data
     command: minio server /minio_data --console-address ":9090"
@@ -34,6 +36,7 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+    restart: unless-stopped
 
   milvus:
     container_name: milvus-standalone
@@ -44,6 +47,8 @@ services:
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
+      # 增加 gRPC 重试间隔，避免 Windows I/O 慢导致死循环
+      METASTORE_GRPC_RETRY_INTERVAL: 5000
     volumes:
       - ./volumes/milvus:/var/lib/milvus
     healthcheck:
@@ -53,21 +58,26 @@ services:
       timeout: 20s
       retries: 3
     ports:
-      - "19530:19530"
-      - "9091:9091"
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
     depends_on:
-      - etcd
-      - minio
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
 
   # ==================== Neo4j 图数据库 ====================
   neo4j:
     image: neo4j:5.18
     container_name: clinical-neo4j-db
     ports:
-      - 8474:7474
-      - 8687:7687
+      # 仅绑定回环：Neo4j Browser 与 Bolt 只需本机可访问
+      - "127.0.0.1:8474:7474"
+      - "127.0.0.1:8687:7687"
     environment:
-      NEO4J_AUTH: neo4j/changeme
+      # 密码从 .env 读取；未设置时 compose 直接报错，不会静默使用弱默认值
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD 未设置，请复制 .env.example 为 .env 并填写}
       NEO4J_dbms_connector_bolt_advertised__address: localhost:8687
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_apoc_export_file_enabled: "true"
@@ -79,10 +89,116 @@ services:
       - ./data/neo4j/plugins:/plugins
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "changeme", "RETURN 1"]
+      test: ["CMD", "cypher-shell", "-u", "${NEO4J_USER:-neo4j}", "-p", "${NEO4J_PASSWORD:?}", "RETURN 1"]
       interval: 30s
       timeout: 10s
       retries: 5
+
+  # ==================== 后端 API（同时托管前端静态资源）====================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentic-rag-api:local
+    container_name: agentic-rag-api
+    env_file:
+      - .env
+    environment:
+      # .env 是宿主机视角的配置，容器内必须改写。
+      # 注意内部 bolt 端口是 7687，宿主机上的 8687 只是对外重映射。
+      NEO4J_URI: bolt://neo4j:7687
+      MILVUS_HOST: milvus
+      MILVUS_PORT: "19530"
+      NEO4J_DATABASE: neo4j
+      # 公网部署绝不可开闸：留空 ACCESS_PASSWORD 时后端默认拒绝服务
+      ALLOW_NO_AUTH: "0"
+      # 模型走本地目录，禁止任何 Hub 联网兜底
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      STATIC_DIR: /app/static
+    volumes:
+      # 容器内路径必须保持与宿主一致的布局：config.py 的 medical_csv_dir /
+      # embedding_model / ner_model_path / disease_dict_path 全部由 __file__
+      # 推导，且不可用环境变量覆盖。只挂实际用到的两个模型目录，
+      # 不暴露未启用的 bge-m3（4.3G）。
+      - ./models/bge-base-zh-v1.5:/app/models/bge-base-zh-v1.5:ro
+      - ./models/TCMNER:/app/models/TCMNER:ro
+      # SQLite 与记忆 WAL 放命名卷：qa_database.py 每次连接都设 WAL 模式，
+      # 而 WAL 依赖 -shm 共享内存与 POSIX 建议锁，跑在 Docker Desktop 的
+      # Windows 9p 挂载上是已知的不可靠组合（database is locked，甚至静默损坏）。
+      - rag_state:/app/data
+      - ./data/processed:/app/data/processed:ro
+      - ./data/disease_dict_expanded.txt:/app/data/disease_dict_expanded.txt:ro
+      # SPA 产物只读挂载：前端是独立仓库、独立构建，挂载比 COPY 进镜像更贴合
+      # 事实，改前端也不必重建后端镜像。
+      - ./frontend/dist:/app/static:ro
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    healthcheck:
+      # 必须看响应体而非只看状态码：RAG 未就绪时 /api/health 同样返回 200，
+      # 但 body 是 {"status":"initializing"}。只看状态码会在第 2 秒误判健康。
+      test:
+        - CMD
+        - python
+        - -c
+        - import json,sys,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=3)); sys.exit(0 if d.get('status')=='ok' else 1)
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      # 冷启动要加载 BGE + TCMNER 并检查图谱同步。start_period 内的失败不
+      # 计入 retries，给足余量，避免把正常初始化误判成不健康。
+      start_period: 300s
+      start_interval: 10s
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # GPU 透传。语义重排要对 150 个候选文档做 BGE 嵌入：CPU 上约 50s，
+    # GPU 上约 5s，直接决定访客等多久才看到第一个字。
+    # 没有 N 卡的机器删掉这个 deploy 块即可，镜像功能不受影响（回落到 CPU）。
+    # deploy.resources.reservations 在非 swarm 的 docker compose up 下同样生效。
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # 不开 ports:。_client_ip() 无条件信任 cf-connecting-ip，这在 Cloudflare
+    # 之后是对的；但若 8000 端口能被别的来源访问，攻击者就能伪造该头、每个
+    # 请求换一个限流桶，等于废掉 /api/auth 唯一的暴破防护。
+    # 本机调试时再临时加：- "127.0.0.1:8000:8000"
+
+  # ==================== Cloudflare Tunnel ====================
+  # 令牌模式（dashboard 托管）：入口规则在 Cloudflare 控制台配，源站指向
+  # http://api:8000 —— 这是 compose 网络内的服务名，不是 localhost。
+  # 好处是容器里不必管理 cert.pem 与 credentials.json 这类长期凭据文件；
+  # 代价是入口配置存在控制台而不在版本控制里（README「公网部署」一节写了步骤）。
+  cloudflared:
+    # 锁具体版本，不用 :latest：隧道是唯一的对外入口，不希望它在某次
+    # `docker compose pull` 之后悄悄变成另一个大版本。
+    image: cloudflare/cloudflared:2026.9.1
+    container_name: agentic-rag-tunnel
+    # token 走 TUNNEL_TOKEN 环境变量：cloudflared 的 --token 默认值就读它，
+    # 这样不必把 token 写进 command，免得出现在 docker top 的 argv 里。
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?请在 .env 中填入 Cloudflare Tunnel token}
+    # 镜像的 ENTRYPOINT 已是 ["cloudflared","--no-autoupdate"]，所以这里不再
+    # 重复 --no-autoupdate，也不会触发容器内自更新重启。
+    command: tunnel run
+    depends_on:
+      api:
+        # 等 api 真正健康再连：否则隧道会先接上一个还没开始监听的源，
+        # 头 30–60 秒的请求全是 502。
+        condition: service_healthy
+    restart: unless-stopped
+    # 同样不开 ports:。隧道是纯出站连接（QUIC/7844，可回落 HTTP/2 over 443），
+    # 宿主机无需任何入站端口。
+
+volumes:
+  rag_state:
 
 networks:
   default:
