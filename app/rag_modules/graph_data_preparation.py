@@ -4,12 +4,13 @@
 
 import logging
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Optional
 from dataclasses import dataclass
 import pandas as pd
 import os
 import re
 import hashlib
+import time
 from neo4j import GraphDatabase
 from langchain_core.documents import Document
 
@@ -33,7 +34,8 @@ class GraphRelation:
 
 
 class MedicalDataPreparationModule:
-    def __init__(self, config, csv_dir: str, uri: str, user: str, password: str, database: str = "neo4j"):
+    def __init__(self, config, csv_dir: str, uri: str, user: str, password: str, database: str = "neo4j",
+                 llm_client: Optional[Any] = None, use_ner: bool = True):
         self.config = config
         self.csv_dir = csv_dir
         self.uri = uri
@@ -41,16 +43,32 @@ class MedicalDataPreparationModule:
         self.password = password
         self.database = database
         self.driver = None
+        self.llm_client = llm_client
+        self.use_ner = use_ner
 
         self.documents = []
         self.chunks = []
         self.qa_pairs = []
 
-        # 1. 加载疾病本地词典并编译正则（O(N) 匹配，替代 O(N×D) 暴力循环）
-        disease_dict_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data", "disease_dict.txt")
-        self.disease_dict = self._load_disease_dict(disease_dict_path)
-        self._disease_pattern = self._build_disease_pattern()
-        logger.info(f"成功加载本地疾病词典，共包含 {len(self.disease_dict)} 个疾病条目")
+        # === 三层实体抽取初始化 ===
+        # 1. 加载扩展疾病词典（优先尝试 expanded 格式，回退旧格式）
+        disease_dict_path = getattr(config, 'disease_dict_path', None) or \
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data", "disease_dict_expanded.txt")
+        self.disease_dict, self.disease_aliases = self._load_expanded_disease_dict(disease_dict_path)
+
+        # 2. 构建 FlashText 处理器（主选），无 flashtext 则降级为正则
+        self._flashtext_processor = self._build_flashtext_processor()
+        if self._flashtext_processor:
+            logger.info(f"三层抽取 L1 就绪: FlashText ({len(self.disease_aliases)} 个关键词)")
+        else:
+            # 降级：用旧格式词典编译正则
+            self._disease_pattern = self._build_disease_pattern()
+            logger.info(f"三层抽取 L1 就绪: 正则在用 ({len(self.disease_dict)} 个主名)")
+
+        # 3. NER pipeline 惰性加载
+        self._ner_pipeline = None
+        logger.info(f"三层抽取 L2 待命: TCMNER ({'启用' if use_ner else '禁用'})")
+        logger.info(f"三层抽取 L3 待命: DeepSeek LLM ({'启用' if llm_client else '禁用'})")
 
         self._connect()
 
@@ -70,12 +88,233 @@ class MedicalDataPreparationModule:
         return re.compile('|'.join(escaped))
 
     def _extract_diseases_by_dict(self, title: str, ask: str, answer: str) -> list:
-        "编译正则单次扫描提取所有匹配疾病"
+        "编译正则单次扫描提取所有匹配疾病（旧版单层方法，保留兼容）"
         combined_text = f"{title} {ask} {answer}"
         if not self._disease_pattern:
             return []
         matches = self._disease_pattern.findall(combined_text)
         return list(set(matches))
+
+    # ==================== 三层实体抽取（L1 FlashText / L2 TCMNER / L3 LLM）====================
+
+    def _load_expanded_disease_dict(self, filepath: str) -> tuple:
+        """
+        加载扩展疾病词典（格式：主疾病名|别名1|别名2|...）
+        返回:
+            main_names: List[str] — 主疾病名列表（去重、按长度降序）
+            alias_map: Dict[str, str] — 别名→主疾病名映射（含主名→主名）
+        """
+        main_names = []
+        alias_map = {}
+
+        if not os.path.exists(filepath):
+            logger.warning(f"扩展词典不存在: {filepath}，回退旧格式")
+            fallback_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data", "disease_dict.txt"
+            )
+            old_list = self._load_disease_dict(fallback_path)
+            for name in old_list:
+                main_names.append(name)
+                alias_map[name] = name
+            return main_names, alias_map
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split('|')
+                primary = parts[0].strip()
+                if not primary or len(primary) < 2:
+                    continue
+                main_names.append(primary)
+                alias_map[primary] = primary
+                for alias in parts[1:]:
+                    alias = alias.strip()
+                    if alias and len(alias) >= 2:
+                        alias_map[alias] = primary
+
+        # 去重 + 按长度降序（长匹配优先）
+        seen = set()
+        deduped = []
+        for n in main_names:
+            if n not in seen:
+                seen.add(n)
+                deduped.append(n)
+        main_names = sorted(deduped, key=len, reverse=True)
+
+        logger.info(f"加载扩展词典: {len(main_names)} 个主名, {len(alias_map)} 个别名映射")
+        return main_names, alias_map
+
+    def _build_flashtext_processor(self):
+        """
+        构建 FlashText 关键词处理器。
+        所有疾病名和别名注册为关键词，匹配后映射回主疾病名。
+        返回: KeywordProcessor 实例，或 None（降级回正则）
+        """
+        if not self.disease_aliases:
+            return None
+        try:
+            from flashtext import KeywordProcessor
+            processor = KeywordProcessor(case_sensitive=False)
+            for alias, primary in self.disease_aliases.items():
+                processor.add_keyword(alias, primary)
+            return processor
+        except ImportError:
+            logger.warning("flashtext 未安装，降级为正则匹配，可执行: pip install flashtext>=2.7")
+            return None
+
+    def _extract_diseases(self, title: str, ask: str, answer: str) -> list:
+        """
+        三层实体抽取主入口。
+
+        按顺序尝试：
+          L1 FlashText（O(N) 词典匹配，覆盖绝大多数已知疾病及别名）
+          L2 TCMNER（GPU 推理，捕捉未登录的正式疾病名）
+          L3 DeepSeek LLM（最慢最贵，最后兜底）
+        任一层返回非空即终止并返回。全空则返回 []（QA 对被跳过）。
+        """
+        combined_text = f"{title} {ask} {answer}"
+
+        # L1: FlashText（最快，大多数情况在此层返回）
+        diseases = self._extract_by_flashtext(combined_text)
+        if diseases:
+            logger.debug(f"三层抽取 L1 命中 {len(diseases)} 个疾病")
+            return diseases
+
+        # L2: TCMNER（GPU）
+        if self.use_ner:
+            try:
+                diseases = self._extract_by_ner(combined_text)
+                if diseases:
+                    logger.debug(f"三层抽取 L2 命中 {len(diseases)} 个疾病")
+                    return diseases
+            except Exception as e:
+                logger.warning(f"三层抽取 L2 TCMNER 失败: {e}，跳过")
+
+        # L3: DeepSeek LLM（最后兜底）
+        if self.llm_client:
+            try:
+                diseases = self._extract_by_llm(title, ask, answer)
+                if diseases:
+                    logger.debug(f"三层抽取 L3 命中 {len(diseases)} 个疾病")
+                    return diseases
+            except Exception as e:
+                logger.warning(f"三层抽取 L3 LLM 失败: {e}，跳过")
+
+        return []
+
+    def _extract_by_flashtext(self, text: str) -> list:
+        """L1: FlashText O(N) 关键词匹配"""
+        if not self._flashtext_processor or not text:
+            return []
+        found = self._flashtext_processor.extract_keywords(text)
+        return list(set(found))
+
+    def _extract_by_ner(self, text: str) -> list:
+        """L2: TCMNER 模型 NER（惰性加载，GPU 可用）"""
+        if not text.strip():
+            return []
+
+        # 惰性加载
+        if self._ner_pipeline is None:
+            ner_model_path = getattr(self.config, 'ner_model_path', None) or \
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "models", "TCMNER")
+            if not os.path.exists(ner_model_path):
+                logger.warning(f"TCMNER 模型路径不存在: {ner_model_path}，禁用 L2")
+                self._ner_pipeline = False  # 标记永久不可用
+                return []
+
+            try:
+                import torch
+                from transformers import pipeline
+
+                device = 0 if torch.cuda.is_available() else -1
+                logger.info(f"正在加载 TCMNER 模型 (device={'cuda' if device == 0 else 'cpu'})...")
+                self._ner_pipeline = pipeline(
+                    "ner",
+                    model=ner_model_path,
+                    tokenizer=ner_model_path,
+                    device=device,
+                )
+                logger.info("TCMNER 模型加载完成")
+            except Exception as e:
+                logger.error(f"TCMNER 模型加载失败: {e}")
+                self._ner_pipeline = False  # 标记不可用
+                return []
+
+        if self._ner_pipeline is False:
+            return []
+
+        try:
+            results = self._ner_pipeline(text)
+        except Exception as e:
+            logger.error(f"TCMNER 推理失败: {e}")
+            return []
+
+        # 过滤：只保留"病名"类型实体（B-病名 / I-病名），score ≥ threshold
+        threshold = getattr(self.config, 'ner_confidence_threshold', 0.5)
+        disease_set = set()
+        for r in results:
+            entity = r.get("entity", "")
+            score = r.get("score", 0)
+            word = r.get("word", "").strip()
+            if "病名" in entity and score >= threshold:
+                # 处理 HuggingFace 子词碎片（##xxx）
+                if word.endswith("##"):
+                    word = word[:-2]
+                if word.startswith("##"):
+                    word = word[2:]
+                if word and len(word) >= 2:
+                    disease_set.add(word)
+
+        return list(disease_set)
+
+    def _extract_by_llm(self, title: str, ask: str, answer: str) -> list:
+        """L3: DeepSeek LLM 兜底抽取（最慢最贵）"""
+        if not self.llm_client:
+            return []
+
+        prompt = (
+            "你是一位医学文本分析专家。请从以下医患对话中提取所有明确提到的疾病名称。\n\n"
+            f"【病例标题】{title}\n"
+            f"【患者提问】{ask}\n"
+            f"【医生回答】{answer}\n\n"
+            "要求：\n"
+            "1. 只输出标准临床疾病名称，每行一个，无需序号和解释\n"
+            "2. 如果未明确提及任何疾病，直接输出「无」\n"
+            "3. 只提取明确提到的疾病名称（症状、药物不是疾病）\n"
+        )
+
+        for attempt in range(3):
+            try:
+                resp = self.llm_client.chat.completions.create(
+                    # 不能写死模型名：写死之后换 LLM_MODEL 时本模块会静默地
+                    # 继续用旧模型，是最容易漏掉的一处配置漂移。
+                    model=self.config.llm_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=512,
+                )
+                content = resp.choices[0].message.content.strip()
+                if not content or content == "无":
+                    return []
+
+                diseases = []
+                for line in content.split("\n"):
+                    line = line.strip()
+                    line = re.sub(r"^[\d\-*•]+[\.\、\）\)]\s*", "", line).strip()
+                    if line and len(line) >= 2 and re.search(r"[一-鿿]", line):
+                        diseases.append(line)
+
+                return list(set(diseases))
+
+            except Exception as e:
+                logger.warning(f"L3 LLM 调用失败 (第{attempt + 1}次): {e}")
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+
+        return []
 
     def _extract_drugs(self, text: str) -> list:
         """
@@ -208,7 +447,7 @@ class MedicalDataPreparationModule:
 
             for idx, qa in enumerate(self.qa_pairs):
                 # 1. 执行词典匹配疾病
-                diseases = self._extract_diseases_by_dict(qa['title'], qa['ask'], qa['answer'])
+                diseases = self._extract_diseases(qa['title'], qa['ask'], qa['answer'])
 
                 if not diseases:
                     skipped_count += 1
@@ -310,9 +549,8 @@ class MedicalDataPreparationModule:
         for qa in self.qa_pairs:
             try:
                 content = (
-                    f"【历史病例_所属科室】：{qa['department']}\n"
-                    f"【历史病例_核心问题】：{qa['title']}\n"
-                    f"【历史病例_患者主诉/提问】：{qa['ask']}"
+                    f"【核心问题】：{qa['title']}\n"
+                    f"【患者描述】：{qa['ask']}"
                 )
                 node_id = self._generate_node_id(qa)
 

@@ -100,7 +100,17 @@ class GenerationIntegrationModule:
                 max_tokens=self.max_tokens
             )
 
-            answer = response.choices[0].message.content.strip()
+            # content 为 None 时直接 .strip() 会 AttributeError，先兜住
+            answer = (response.choices[0].message.content or "").strip()
+
+            # 正文为空必须当作失败。曾经这里会把空正文照原样返回，再追加一句
+            # 免责声明，于是"只有一个免责声明的回答"被当成成功落库、进历史记录。
+            # 最典型的成因是推理模型把 max_tokens 预算全用在思考上（见
+            # app/config.py 的 llm_model 注释）。抛出去由下面的 except 兜住，
+            # 转成一条明确的错误信息，而不是一条假装成功的空回答。
+            if not answer:
+                raise ValueError("模型返回空正文（疑似 max_tokens 被推理模型的思考吃光）")
+
             # 强制追加免责声明
             disclaimer = "\n\n⚠️ 【医疗免责声明】：本系统的分析基于既往病例与知识图谱自动生成，仅供临床辅助参考，不能替代专业执业医师的当面诊断。具体用药及治疗方案请严格遵照医嘱。"
             if "免责声明" not in answer:
@@ -156,6 +166,14 @@ class GenerationIntegrationModule:
                         full_response += content
                         yield content
 
+                # 一个正文 chunk 都没收到，就是失败。不能在这里补一句免责声明
+                # 当作成功——那正是"回答只有免责声明"的成因（推理模型把
+                # max_tokens 全花在思考上时就是这样）。抛出去交给下面的 except，
+                # 复用既有的重试与兜底链；重试仍失败时用户会看到明确的错误，
+                # 而不是一条看起来正常、实则空心的临床建议。
+                if not full_response.strip():
+                    raise ValueError("模型未返回任何正文（疑似 max_tokens 被推理模型的思考吃光）")
+
                 # 检查并追加免责声明
                 if "免责声明" not in full_response:
                     disclaimer = "\n\n⚠️ 【医疗免责声明】：本系统的分析基于既往病例与知识图谱自动生成，仅供临床辅助参考，不能替代专业执业医师的当面诊断。具体用药及治疗方案请严格遵照医嘱。"
@@ -168,7 +186,8 @@ class GenerationIntegrationModule:
 
                 if attempt < max_retries - 1:
                     wait_time = (attempt + 1) * 2
-                    yield f"\n[系统提示：网络波动，{wait_time}秒后重试连接...]\n"
+                    # 措辞保持中性：失败原因未必是网络，也可能是上面那种空正文
+                    yield f"\n[系统提示：本次生成中断，{wait_time}秒后重试...]\n"
                     time.sleep(wait_time)
                     continue
                 else:

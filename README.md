@@ -77,8 +77,9 @@ Agentic-RAG 是面向临床场景的**图谱增强检索生成（GraphRAG）**�
 | 嵌入模型   | BAAI/bge-base-zh-v1.5（768 维）                          |
 | 框架       | LangChain, HuggingFace Transformers, Sentence-Transformers |
 | API 层     | FastAPI + SSE 流式                                       |
-| 前端       | React 19 + TypeScript + Vite（GitHub Pages 部署）         |
-| 基础设施   | Docker Compose（etcd + MinIO + Milvus + Neo4j）          |
+| 前端       | React 19 + TypeScript + Vite                             |
+| 部署       | Docker Compose 全栈编排 + Cloudflare Tunnel 固定域名      |
+| 访问控制   | HMAC-SHA256 签名令牌 + PBKDF2 访问码 + 按患者会话隔离      |
 
 ## 快速开始
 
@@ -86,7 +87,39 @@ Agentic-RAG 是面向临床场景的**图谱增强检索生成（GraphRAG）**�
 
 - Python 3.11+
 - Docker & Docker Compose
-- CUDA（可选，GPU 加速嵌入）
+- NVIDIA GPU（可选，但强烈建议）
+
+**关于 GPU**：嵌入模型 BGE 的推理速度决定了访客要等多久才看到第一个字。
+图谱检索会对 150 个候选文档做一次语义重排（`graph_rag_retrieval.py` 的
+`max_rerank_candidates`），这一段实测：
+
+| 设备 | `graph_rag_search` | 端到端首 token |
+| --- | --- | --- |
+| CPU（容器，仅 torch CPU 版） | 50.6s | 74.3s |
+| RTX 3060（首次，含 CUDA 上下文初始化） | 14.8s | 20.2s |
+| RTX 3060（后续） | 4.0s | 17.6s |
+
+CPU 那一列会顶到 Cloudflare 100 秒的源站超时上限，所以有独显时建议走 GPU。
+
+镜像默认装 CUDA 版 torch。**没有 N 卡的机器不用改任何东西**——CUDA wheel
+自带完整 CPU 后端，会自动回落，只是慢。想省体积（实测 6.74GB → 2.04GB）：
+
+```bash
+docker compose build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+```
+
+用 GPU 就要保留 `docker-compose.yml` 里 `api` 服务的 `deploy.resources` 段；
+没有 N 卡则**必须删掉它**，否则容器起不来。
+
+构建默认走清华 PyPI 镜像（官方源 + `pypi.nvidia.com` 在国内实测会断流）。
+要换回官方源：
+
+```bash
+docker compose build --build-arg PIP_INDEX_URL=https://pypi.org/simple
+```
+
+用了 GPU 就要在 `docker-compose.yml` 的 `api` 服务里保留 `deploy.resources`
+那段；没有 N 卡则删掉它（否则容器起不来）。
 
 ### 1. 克隆与配置
 
@@ -95,18 +128,66 @@ git clone <repo-url>
 cd Agentic-RAG
 ```
 
-编辑 `.env`，填入 DeepSeek API key：
-```env
-DEEPSEEK_API_KEY=sk-your-key-here
+复制环境变量模板并填写：
+```bash
+cp .env.example .env
 ```
+
+必须填写的三项：
+```env
+DEEPSEEK_API_KEY=sk-your-key-here   # DeepSeek 控制台申请
+ACCESS_PASSWORD=                    # 访问系统的全局密码
+NEO4J_PASSWORD=                     # Neo4j 密码，与 docker compose 共用
+```
+
+`SECRET_KEY` 用于签发访问令牌与患者身份令牌，留空时会从 `ACCESS_PASSWORD`
+派生；**公网部署务必单独设置**，生成方式：
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+> `ACCESS_PASSWORD` 留空时后端默认拒绝全部受保护接口（fail closed），
+> 本机调试可临时设置 `ALLOW_NO_AUTH=1`，切勿在公网启用。
+
+#### 模型选型：必须用非推理模型
+
+`LLM_MODEL` 默认 `deepseek-chat`，**不要换成推理模型**（`deepseek-reasoner`、
+`deepseek-v4-flash` 一类）。推理模型先输出 `reasoning_content`（思考）再输出正文，
+二者共用同一个 `max_tokens` 预算；而本仓库没有任何一处读 `reasoning_content`，
+于是预算被思考吃光时正文变成空字符串，且**不抛任何异常**。
+
+代价是整条流水线静默降级，且四个症状看起来互不相关，很难一眼归因到模型上：
+
+| 症状 | 实际原因 |
+|------|----------|
+| 回答只有一句免责声明、正文为空 | 生成时思考吃光了 `max_tokens` |
+| 日志出现 `未能提取有效 JSON，降级为规则匹配` | 路由的 JSON 输出被思考挤掉 |
+| 日志出现 `医学关键词提取失败` | 关键词抽取的 JSON 输出被思考挤掉 |
+| 实体级 / 临床主题级检索恒返回 0 条 | 上一条导致双层检索没有输入 |
+
+最后一条尤其隐蔽：**「Agentic」的双层检索会整个失效，只剩向量层单路在工作**，
+而系统表面完全正常。实测 `deepseek-chat` 思考 0 字、首字延迟 ~0.8s，
+而推理模型在同一批问题上是 ~8s 首字且约 1/5 的正文为空。
+
+代码侧已加了两道防线（生成器空正文直接报错、评测 judge 不静默兜底），
+但模型选型仍是根因，换模型前请先读 `app/config.py` 中 `llm_model` 处的注释。
 
 ### 2. 启动服务
 
 ```bash
+cd frontend && npm run build && cd ..   # 首次需要：构建 SPA 产物
 docker compose up -d
 ```
 
-服务端口：Milvus `19530`，Neo4j Bolt `8687`，Neo4j HTTP `8474`
+一条命令起全栈：Milvus、etcd、MinIO、Neo4j，以及后端 API。API 容器同时托管前端
+页面和接口，本机直接打开 `http://localhost:8000` 即可使用，无需另起 dev server。
+
+首次启动要加载嵌入模型并检查图谱同步，需要几分钟。想等真正就绪再加 `--wait`。
+
+> 只想跑数据存储、后端在宿主机上原生开发时：
+> `docker compose up -d etcd minio milvus neo4j`
+
+数据库端口：Milvus `19530`，Neo4j Bolt `8687`，Neo4j HTTP `8474`
 
 ### 3. 安装依赖
 
@@ -138,62 +219,143 @@ python app/main.py
 | `quit` | 安全退出（自动持久化记忆） |
 
 **Web UI 模式（FastAPI + React）：**
+
+容器化部署下，页面和接口都由 `api` 容器提供，直接开 `http://localhost:8000` 即可，
+不需要单独启动前端。
+
+要在宿主机上原生调试后端：
 ```bash
 uvicorn app.api:app --host 0.0.0.0 --port 8000
 ```
+此时 `app/api.py` 会自动回落到 `<repo>/frontend/dist` 提供页面；
+若该目录不存在，接口仍可用，但静态页面返回 404 并提示先构建前端。
 
 前端开发模式（带热更新，API 自动代理到 8000）：
 ```bash
 cd frontend && npm run dev
 ```
 
-## 公网展示：GitHub Pages + 本地后端
+## 公网部署：Cloudflare Tunnel + 固定域名
 
-前端部署在 GitHub Pages，后端在本地运行，通过 HTTPS 隧道打通。
+前端与后端跑在同一组容器里，由一条 Cloudflare Tunnel 暴露，共用一个 HTTPS 域名。
+同源意味着没有跨域、没有 mixed content，访客打开一个链接就能用，无需任何配置。
 
 ```
-浏览器 (https://dyk-dd.github.io) ──HTTPS──▶ ngrok 隧道 ──HTTP──▶ localhost:8000
+浏览器 ──HTTPS──▶ Cloudflare 边缘 ──隧道──▶ cloudflared 容器
+                                                │ http://api:8000
+                                                ▼
+                                        api 容器（FastAPI + SPA 静态资源）
+                                          ├── bolt://neo4j:7687
+                                          └── milvus:19530
 ```
 
-### 操作步骤
+宿主机不开放任何入站端口——隧道是纯出站连接。
 
-1. **启动基础设施**
+> **代价要说清楚**：后端跑在个人电脑上，机器关机或休眠时站点就打不开。
+> 这是「本地后端 + 隧道」这种形态的固有代价，不是配置问题。
+
+### 1. 域名与隧道
+
+1. 买一个域名（`.top` / `.xyz` 首年约 ¥10–30），在注册商处把 NS 改成 Cloudflare 分配的两个地址。
+   **改完不要用公共 DNS 判断是否生效**：`.com` 的顶级域委派有最长 48 小时的刷新周期，
+   `nslookup -type=NS 你的域名 8.8.8.8` 可能一整天都还返回注册商的旧 NS。注册局侧是否已接受，
+   查 whois 更准（`whois 你的域名 | grep -i "name server"`）。
+2. 登录 [Cloudflare Zero Trust](https://one.dash.cloudflare.com/) → Networks → Tunnels → **Create a tunnel**，选 Cloudflared，命名如 `agentic-rag`
+3. 复制生成的 **token**（只显示一次）
+4. 在该隧道的 **Public Hostnames** 里添加一条：Subdomain 填 `www`（随意，本项目用
+   `www.你的域名`），Domain 选你的域名，Service 类型选 `HTTP`，
+   URL 填 **`api:8000`**
+5. 把 token 写进 `.env` 的 `TUNNEL_TOKEN=`
+
+第 4 步的 URL 必须填 `api:8000` —— 这是 compose 网络内的服务名，**不是 `localhost`**。
+Cloudflare 会自动为 `www.你的域名` 建一条指向隧道的 CNAME，DNS 无需手动配置。
+
+> **填错这里会得到什么**：写 `localhost:8000` 的话，连接器容器里的 `localhost`
+> 是它自己的回环，不是 api 容器 —— 日志里会是
+> `Unable to reach the origin service ... dial tcp [::1]:8000: connect: connection refused`。
+> 改完记得在控制台点保存，改完可以重启连接器核对实际生效的配置：
+> ```bash
+> docker compose logs cloudflared | grep -o 'ingress.*http_status'
+> ```
+> 输出里的 `"service"` 字段就是真正生效的源站地址。
+
+> **宿主机上不要再跑一个 cloudflared**。用同一个 token 在宿主机装过服务
+> （`cloudflared service install`）的话，它会和容器里的连接器同时挂到同一条隧道上，
+> Cloudflare 把请求轮流分给两者。宿主机那个解析 `localhost:8000` 是通的（走 api 的
+> 已发布端口），容器那个不通 —— 表现出来就是**大约一半请求 502、一半正常**，
+> 极难排查。装过就停掉：
+> ```powershell
+> sc.exe stop Cloudflared
+> sc.exe config Cloudflared start= disabled
+> ```
+
+> 入口规则存在 Cloudflare 控制台而不是仓库里，这是令牌模式（dashboard 托管）
+> 换取"不必在容器里管理 cert.pem 与长期凭据文件"的代价。
+
+### 2. 启动
 
 ```bash
-docker compose up -d   # Milvus + Neo4j
+cd frontend && npm run build && cd ..   # 构建 SPA 产物（容器只读挂载它）
+docker compose up -d --wait             # --wait 会等到 /api/health 真正就绪
 ```
 
-1. **启动后端**
+`/api/health` 在 RAG 未就绪时也返回 200，但 body 是 `{"status":"initializing"}`。
+健康检查是看 body 而不是状态码的，所以 `--wait` 期间的等待是真实的——首次启动
+要加载嵌入模型并核对图谱同步，几分钟属正常。
+
+### 3. Cloudflare 侧需要关掉的开关
+
+| 开关 | 位置 | 为什么 |
+| --- | --- | --- |
+| Rocket Loader | Speed → Optimization | 会延迟加载 `type="module"` 的 bundle，页面直接白屏 |
+| Auto Minify | Speed → Optimization | 可能破坏已压缩的 JS 产物 |
+| Bot Fight Mode / Under Attack | Security | 会往响应里注入 JS 挑战，SPA 的 `fetch` 无法通过，前端拿到的是 403 HTML 而不是 JSON |
+
+不要给 `/api/*` 配 "Cache Everything" 规则。SSE 流式接口 `/api/chat/stream`
+依赖 `text/event-stream` 不被缓冲或压缩，Cloudflare 默认不会动这个 content type。
+
+实测过这条：开着机器人防护时，`User-Agent: Python-urllib/3.12` 会被直接挡下
+（纯文本 403，无 `cf-mitigated` 挑战头），而 Chrome 与 curl 的 UA 均正常放行。
+真实浏览器因此不受影响，但任何非浏览器客户端（监控探针、脚本化的冒烟测试、
+`curl` 之外的 HTTP 库）都会拿到 403 —— 用 Python 写验证脚本时要自己带上浏览器 UA。
+
+### 4. 数据在哪里
+
+SQLite（患者、会话、问答记录）存在 Docker 命名卷 `rag_state` 里，不落宿主机目录。
+这是刻意的：SQLite 的 WAL 模式依赖共享内存与 POSIX 建议锁，跑在 Docker Desktop 的
+Windows 挂载上是已知的不可靠组合，并发下会 `database is locked`，甚至静默损坏。
+
+备份出来：
 
 ```bash
-uvicorn app.api:app --host 0.0.0.0 --port 8000
+docker run --rm -v agentic-rag_rag_state:/src -v "$PWD/data:/dst" alpine \
+  cp -av /src/qa_history.db /dst/
 ```
 
-1. **启动 ngrok 隧道**
+### 5. 本机验证（不走隧道）
 
-```bash
-ngrok http 8000
-```
-
-ngrok 会输出一个公网 HTTPS 地址，格式为 `https://xxxx.ngrok-free.app`。
-
-1. **打开前端，配置后端地址**
-
-访问 `https://dyk-dd.github.io`，点击左侧边栏底部的 ⚙ 后端连接，粘贴 ngrok 提供的 HTTPS 地址，点击测试后保存即可。
-
-> 每次重启 ngrok 会生成新地址（免费版），重新粘贴即可。付费版可使用固定域名。
+容器内已经同时提供前端和 API，直接开 `http://localhost:8000` 走完整流程即可。
+`api` 容器默认不发布端口，本机调试时在 `docker-compose.yml` 里临时加上
+`ports: ["127.0.0.1:8000:8000"]`；**不要绑到 `0.0.0.0`**——限流依赖
+`cf-connecting-ip` 头，端口一旦对别的来源可达，该头就能被伪造，等于绕过
+`/api/auth` 的暴破防护。
 
 ## 项目结构
 
 ```
 Agentic-RAG/
-├── .env                  # API key 等环境变量
+├── .env                  # API key、访问密码、隧道 token
 ├── .env.example          # 环境变量模板
 ├── requirements.txt      # Python 依赖
+├── Dockerfile            # 后端 API 镜像（同时托管前端静态资源）
+├── .dockerignore
 ├── docker-compose.yml    # 全部服务编排
 │
 ├── app/                  # 主应用
 │   ├── main.py           # 系统入口 & 协调器
+│   ├── api.py            # FastAPI：REST + SSE，并托管前端页面
+│   ├── security.py       # HMAC 签名令牌（访问令牌 + 患者身份令牌）
+│   ├── qa_database.py    # SQLite 会话与问答持久化
 │   ├── web_app.py        # Streamlit Web UI
 │   ├── config.py         # 全局配置 (GraphRAGConfig)
 │   ├── clean_milvus.py   # 清理 Milvus 集合
@@ -259,7 +421,8 @@ Agentic-RAG/
 | `neo4j_uri` | `bolt://localhost:8687` | Neo4j 连接 |
 | `milvus_host` / `milvus_port` | `localhost:19530` | Milvus 连接 |
 | `embedding_model` | `<auto>/models/bge-base-zh-v1.5` | 嵌入模型路径 |
-| `llm_model` | `deepseek-v4-flash` | 生成模型 |
+| `llm_model` | `deepseek-chat` | 生成模型，**必须是非推理模型**（原因见「模型选型」一节） |
+| `max_tokens` | `4096` | 生成上限，需调用方显式传入才生效 |
 | `top_k` | `5` | 检索返回数 |
 | `temperature` | `0.1` | 生成温度 |
 | `memory_enabled` | `True` | 启用记忆模块 |
