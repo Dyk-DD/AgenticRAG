@@ -18,6 +18,18 @@ session_id 不变），所以图谱记忆完好；但 Milvus 的记忆行**带**
 ⚠️ 本脚本绝不构造 QADatabase()：构造函数里有一次性清理，会在真正的迁移
 开始之前就把数据删掉。全程只用裸 sqlite3。
 
+前置条件（缺一个都会停在 check_schema 或目标校验上）：
+
+  1. 新版后端已经跑过一次，库里有了 email / password_salt / password_hash
+     三列。注意**建列是懒的**：get_qa_db() 要到第一次有请求碰到数据库时才构造
+     QADatabase()，而 /api/health 不碰数据库 —— 所以「重启完容器」并不等于
+     「结构已升级」，在有人真正操作过界面之前，库还是旧结构，本脚本会直接拒绝。
+  2. 目标账号已经在界面上注册好（--to-email 要求 password_hash 非空，否则
+     拒绝迁入）。这条同样要求新后端 + 新前端已经上线。
+
+  于是顺序只能是：上线新版后端 → 发布新前端 → 注册目标账号 → 停 api → 迁移
+  → 起 api。不存在「先迁移再上线」这个顺序。
+
 用法:
   # 先看要改多少，不写任何东西
   python scripts/migrate_sessions_to_account.py \
