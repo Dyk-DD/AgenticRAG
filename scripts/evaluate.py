@@ -205,6 +205,15 @@ def main():
     logger.info("正在初始化 ClinicalDecisionSystem...")
     system = ClinicalDecisionSystem()
     system.initialize_system()
+    # initialize_system() 只**实例化**模块，不加载任何索引 —— 它不碰
+    # index_module.load_collection()，也不建 chunks、不初始化检索器，
+    # 这些全在 build_knowledge_base() 里。漏掉这一步的后果是静默的：
+    # 检索层抛「请先构建或加载向量索引」和 Neo4j driver 为 None，
+    # hybrid_search / graph_rag_search 一律返回 0 篇，于是所有检索指标
+    # 恒为 0.00%，而报告看起来完全正常 —— 曾经就是这样。
+    # 数据已同步时该调用走快路径（只加载已有集合，不重建），实测约 5s。
+    logger.info("加载知识库索引（同步时只加载不重建）...")
+    system.build_knowledge_base()
 
     # 解析 LLM client (for judges)
     llm_client = None
