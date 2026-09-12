@@ -5,6 +5,7 @@
 
 import json
 import logging
+import math
 from collections import defaultdict, deque
 from typing import List, Dict, Tuple, Any, Optional, Set
 from dataclasses import dataclass
@@ -64,15 +65,19 @@ class GraphRAGRetrieval:
         3. 临床子图提取：相关疾病与问答知识网络
     """
     
-    def __init__(self, config, llm_client):
+    def __init__(self, config, llm_client, milvus_module=None):
         self.config = config
         self.llm_client = llm_client
+        self.milvus_module = milvus_module
         self.driver = None
-        
+
         # 图结构缓存
         self.entity_cache = {}  # 实体缓存
         self.relation_cache = {}    # 关系缓存
         self.subgraph_cache = {}    # 子图缓存
+
+        # 语义重排序候选数上限：BGE 模型推理较慢，控制传入候选数平衡速度与召回
+        self.max_rerank_candidates = 150
         
     def initialize(self):
         """初始化图RAG检索系统"""
@@ -106,21 +111,24 @@ class GraphRAGRetrieval:
                 # 移除 n.category，改为可能存在的属性或直接删除
                 entity_query = """
                 MATCH (n)
-                WHERE n.nodeId IS NOT NULL
+                WHERE n.nodeId IS NOT NULL OR n.name IS NOT NULL
                 WITH n, COUNT { (n)--() } as degree
-                RETURN labels(n) as node_labels, n.nodeId as node_id, 
+                RETURN labels(n) as node_labels, n.nodeId as node_id,
                        n.name as name, n.department as department, degree
                 ORDER BY degree DESC
-                LIMIT 1000
+                LIMIT 10000
                 """
 
                 result = session.run(entity_query)
                 for record in result:
                     node_id = record["node_id"]
-                    self.entity_cache[node_id] = {
+                    name = record["name"]
+                    # Disease 节点无 nodeId，用 name 兜底作为 key
+                    key = node_id or f"name:{name}"
+                    self.entity_cache[key] = {
                         "labels": record["node_labels"],
-                        "name": record["name"],
-                        "department": record.get("department"),  # 改为 department 或直接移除
+                        "name": name,
+                        "department": record.get("department"),
                         "degree": record["degree"]
                     }
                 
@@ -146,72 +154,86 @@ class GraphRAGRetrieval:
         理解查询的图结构意图
         核心重构：从自然语言到临床医学图查询的转换
         """
-        prompt = f"""
-        作为医学图谱和临床决策专家，分析以下查询的图结构意图，并将自然语言问题映射到**已有医学知识图谱**上。
+        prompt = f"""你是一个医学图谱查询专家。请将用户的问题映射到医学知识图谱上。
 
-        已知图中大致有以下节点和关系：
-        - 节点类型：
-          - Department：科室节点（如"心血管科"、"消化内科"）
-          - Consultation：病例/问答节点，包含 title（主诉）、ask（病情描述）、answer（医生建议）等属性
-          - Disease/Symptom：疾病或症状节点（如"高血压"、"胃炎"）
-          - Drug：药物节点（如"党参"、"雷贝拉唑"）
-        - 主要关系：
-          - (Consultation)-[:BELONGS_TO_DEPT]->(Department)
-          - (Consultation)-[:MENTIONS_DISEASE]->(Disease)
-          - (Drug)-[:TREATS]->(Disease) 或 (Consultation)-[:MENTIONS_DRUG]->(Drug)
+已知图中的节点类型：
+- **Disease/Symptom**：疾病名（如"高血压"、"胃炎"、"脂肪肝"）
+- **Drug**：药物名（如"党参"、"雷贝拉唑"）
+- **Department**：科室名（如"心血管科"、"消化内科"）
+- **Consultation**：病例/问答节点（含 title、ask、answer 属性）
 
-        请根据上述图结构分析下面的查询：
+主要关系：
+- (Consultation)-[:BELONGS_TO_DEPT]->(Department)
+- (Consultation)-[:MENTIONS_DISEASE]->(Disease)
+- (Drug)-[:TREATS]->(Disease) / (Consultation)-[:MENTIONS_DRUG]->(Drug)
 
-        查询：{query}
+查询：{query}
 
-        请识别：
-        1. 查询类型：
-           - entity_relation: 询问实体间的直接关系（如：高血压和党参有禁忌吗？）
-           - multi_hop: 需要多跳推理（如：高血压患者常去哪个科室？需要：高血压→病例→科室）
-           - subgraph: 需要完整子图（如：心血管科有哪些常见病例和用药？需要科室相关的完整知识网络）
-           - path_finding: 路径查找（如：从症状到确诊用药的临床路径）
-           - clustering: 聚类相似性（如：和这个病例类似的症状有哪些？）
+请分析以下字段，严格按规则执行：
 
-        2. source_entities：
-           - 只包含在图中**很有可能有对应节点**的具体实体名称
-           - 优先选择：科室名（如"心血管科"）、疾病名（如"高血压"）、药物名（如"党参"）
-           - 不要把抽象概念或约束（如"能不能吃"、"怎么办"、"推荐药物"）放进 source_entities
+1. query_type：
+   - entity_relation：实体间直接关系（高血压和党参有禁忌吗？）
+   - multi_hop：多跳推理（高血压患者常去哪个科室？→ 高血压→病例→科室）
+   - subgraph：完整子图（心血管科有哪些常见病例？）
+   - path_finding：路径查找（从症状到确诊用药的路径）
+   - clustering：聚类相似性（和这个病例类似的症状有哪些？）
 
-        3. target_entities：
-           - 只在确实需要限制「路径终点」时填写
-           - 同样只能使用可能出现在 Department / Disease / Drug 节点上的名称
-           - 如果不确定目标实体怎么映射到图中，请返回空列表 []
+2. source_entities：**这是最关键的一步，请严格遵循以下规则：**
+   - ⛔ **禁止**提取症状描述词（如"肚子疼"、"发烧"、"咳嗽"、"拉肚子"、"头晕"、"恶心"、"乏力"等）。这些是症状描述，不是图中的疾病实体。
+   - ✅ 只提取在图中**真实存在**的实体名：
+     * 疾病名（如"高血压"、"胃炎"、"脂肪肝"、"糖尿病"）
+     * 药物名（如"党参"、"阿莫西林"）
+     * 科室名（如"心血管科"、"消化内科"）
+   - 如果查询**只描述了症状**（如"肚子疼、拉肚子、发烧"），但没有明确疾病名 → 尝试推断最可能的疾病名（如"肠胃炎"），如果无法确定则返回空列表 []
+   - 不要把"怎么办"、"能不能吃"、"推荐"等抽象词放进来
 
-        4. relation_types：本次推理中希望优先考虑的关系类型列表
-           - 例如：["MENTIONS_DISEASE", "BELONGS_TO_DEPT", "TREATS"]
+3. target_entities：只在需限制路径终点时填写，同样只填疾病/药物/科室名，不确定则留空 []
 
-        5. max_depth：建议的图遍历深度（1-3 之间的整数）
+4. relation_types：优先考虑的关系类型，如 ["MENTIONS_DISEASE", "BELONGS_TO_DEPT", "TREATS"]
 
-        6. constraints：可选的**属性级约束**，用于表达图结构之外的过滤条件，例如：
-           - 患者特征（如"老年人"、"孕妇"）
-           - 症状限制（如"伴随头晕"）
-           用一个字典描述，例如：
-           {{
-             "patient_type": ["老年人"],
-             "symptom_filter": ["头晕"]
-           }}
+5. max_depth：1-3 的整数
 
-        示例1：
-        查询："高血压患者能吃党参吗？"
-        期望分析：这是 entity_relation 或 multi_hop 查询，需要验证 高血压 和 党参 之间的关联。
+示例：
 
-        返回JSON示例：
-        {{
-          "query_type": "entity_relation",
-          "source_entities": ["高血压", "党参"],
-          "target_entities": [],
-          "relation_types": ["MENTIONS_DISEASE", "MENTIONS_DRUG", "TREATS"],
-          "max_depth": 2,
-          "constraints": {{}}
-        }}
+查询："高血压患者能吃党参吗？"
+{{
+  "query_type": "entity_relation",
+  "source_entities": ["高血压", "党参"],
+  "target_entities": [],
+  "relation_types": ["MENTIONS_DISEASE", "MENTIONS_DRUG", "TREATS"],
+  "max_depth": 2
+}}
 
-        请严格返回一个合法的 JSON 对象，不要包含任何多余的说明文字。
-        """
+查询："我这两天肠胃不舒服，恶心，肚子疼，拉肚子"
+{{
+  "query_type": "multi_hop",
+  "source_entities": ["肠胃炎"],
+  "target_entities": [],
+  "relation_types": [],
+  "max_depth": 2
+}}
+
+查询："宝宝咳嗽发烧两天了，怎么办？"
+{{
+  "query_type": "multi_hop",
+  "source_entities": ["上呼吸道感染"],
+  "target_entities": [],
+  "relation_types": [],
+  "max_depth": 2
+}}
+
+查询："消化内科有哪些常见病？"
+{{
+  "query_type": "subgraph",
+  "source_entities": ["消化内科"],
+  "target_entities": [],
+  "relation_types": ["BELONGS_TO_DEPT", "MENTIONS_DISEASE"],
+  "max_depth": 2
+}}
+
+⚠️ **重要**：如果查询只有症状描述且无法推断具体疾病名，source_entities 返回空列表 []。
+请严格返回 JSON 对象，不要多余文字。
+"""
 
         try:
             response = self.llm_client.chat.completions.create(
@@ -245,9 +267,44 @@ class GraphRAGRetrieval:
                 max_depth=2
             )
 
-    def multi_hop_traversal(self, graph_query: GraphQuery) -> List[GraphPath]:
+    def _tokenize_query(self, query: str) -> List[str]:
+        """将查询文本分词为查询 Token 列表，用于 Cypher 关键词匹配"""
+        if not query or not query.strip():
+            return []
+
+        try:
+            import jieba
+            STOP_WORDS = {
+                "的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都",
+                "一", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着",
+                "没有", "看", "好", "自己", "这", "那", "什么", "怎么", "如何",
+                "为什么", "哪个", "能", "来", "吧", "吗", "嗯", "啊", "哦", "呢",
+                "呀", "嘛", "得", "地", "把", "被", "让", "从", "向", "跟", "为",
+                "因", "所以", "但是", "不过", "因为", "所以", "然后", "之后",
+                "已经", "可以", "应该", "需要", "可能", "想要", "比较", "非常",
+                "特别", "一直", "有点", "一些", "这个", "那个", "这些", "那些",
+                "还是", "请问", "您好", "你好", "谢谢", "感谢", "多久", "多少",
+                "怎么办", "怎么回事", "是否", "是不是", "能不能", "有没有",
+                "会不会", "要不要", "该不该", "做", "进行", "给予", "引起",
+                "导致", "造成", "出现", "产生", "表现", "症状", "情况", "时候",
+                "时间", "方法", "方式", "结果", "效果", "影响", "作用", "问题",
+                "原因", "目的", "意义", "特点", "性质", "什么", "多久",
+            }
+            tokens = jieba.lcut(query)
+            result = [t.strip() for t in tokens
+                      if len(t.strip()) >= 2 and t.strip() not in STOP_WORDS]
+            # 去重保持顺序
+            seen = set()
+            return [t for t in result if not (t in seen or seen.add(t))]
+        except Exception:
+            # jieba 不可用时退化为按常见分隔符拆分
+            tokens = re.split(r'[\s,，。；;：:！!？?、/\\()（）【】\[\]{}]', query)
+            return [t.strip() for t in tokens if len(t.strip()) >= 2]
+
+    def multi_hop_traversal(self, graph_query: GraphQuery, top_k: int = 10, query: str = "") -> List[GraphPath]:
         """临床多跳图遍历"""
-        logger.info(f"执行多跳遍历: {graph_query.source_entities} -> {graph_query.target_entities}")
+        # logger.info(f"执行多跳遍历: {graph_query.source_entities} -> {graph_query.target_entities}")
+        logger.info(f"执行多跳遍历 | source={graph_query.source_entities}, target={graph_query.target_entities}")
         paths = []
         if not self.driver:
             return paths
@@ -258,6 +315,12 @@ class GraphRAGRetrieval:
                 target_keywords = graph_query.target_entities or []
                 max_depth = graph_query.max_depth
 
+                # 关键词匹配 token：从查询文本中提取
+                query_tokens = self._tokenize_query(query) if query else []
+                if not query_tokens:
+                    # 无查询文本时，用 source_entities 作为 token
+                    query_tokens = source_entities[:]
+
                 # 兼容医疗节点的 target 过滤（全部参数化，无字符串拼接）
                 # 兼容医疗节点的 source 匹配 (支持 name 和 title)
                 # 注意: 路径长度使用字面量（Neo4j 5+ 不支持参数化路径长度）
@@ -265,7 +328,6 @@ class GraphRAGRetrieval:
                 UNWIND $source_entities as source_name
                 MATCH (source)
                 WHERE (source.name IS NOT NULL AND source.name CONTAINS source_name)
-                   OR (source.title IS NOT NULL AND source.title CONTAINS source_name)
                    OR source.nodeId = source_name
 
                 MATCH path = (source)-[*1..{max_depth}]-(target)
@@ -279,19 +341,28 @@ class GraphRAGRetrieval:
                     )
                     """ if target_keywords else ""
                 ) + """
-                WITH path, source, target, length(path) as path_len, relationships(path) as rels, nodes(path) as path_nodes
+                WITH path, source, target, length(path) as path_len,
+                     relationships(path) as rels, nodes(path) as path_nodes
                 WITH path, source, target, path_len, rels, path_nodes,
-                     (1.0 / path_len) +
-                     (REDUCE(s = 0.0, n IN path_nodes | s + COUNT { (n)--() }) / 10.0 / size(path_nodes)) +
-                     (CASE WHEN ANY(r IN rels WHERE type(r) IN $relation_types) THEN 0.3 ELSE 0.0 END) as relevance
+                     /* 新评分公式：路径长度权重减半 + 关键词重叠匹配 */
+                     (1.0 / path_len) * 0.4 +
+                     (CASE WHEN SIZE($query_tokens) > 0 THEN
+                         SIZE([kw IN $query_tokens WHERE
+                             (target.title IS NOT NULL AND target.title CONTAINS kw) OR
+                             (target.ask IS NOT NULL AND target.ask CONTAINS kw) OR
+                             (target.name IS NOT NULL AND target.name CONTAINS kw)
+                         ]) * 0.4 / SIZE($query_tokens)
+                      ELSE 0.0 END) +
+                     (CASE WHEN ANY(r IN rels WHERE type(r) IN $relation_types) THEN 0.2 ELSE 0.0 END) as relevance
 
                 ORDER BY relevance DESC
-                LIMIT 20
+                LIMIT 500
                 RETURN path, source, target, path_len, rels, path_nodes, relevance
                 """
 
                 params = {
                     "source_entities": source_entities,
+                    "query_tokens": query_tokens,
                     "relation_types": graph_query.relation_types or [],
                     "max_depth": max_depth,
                 }
@@ -299,10 +370,29 @@ class GraphRAGRetrieval:
                     params["target_keywords"] = target_keywords
 
                 result = session.run(cypher_query, params)
+                all_paths = []
                 for record in result:
                     path_data = self._parse_neo4j_path(record)
                     if path_data:
-                        paths.append(path_data)
+                        all_paths.append(path_data)
+
+                # 后过滤：优先保留含 Consultation 节点（有 qa_xxx nodeId）的路径
+                # 扩大候选集：保证语义重排序有足够多的候选文档
+                # 注意：候选集过小会导致相关度排名靠后但仍相关的路径被截断，
+                #       尤其是当某个疾病关联的 QA 非常多时（如 脂肪肝 有 387+ 条），
+                #       目标 ground truth 节点可能在排名 #200+。需要更大的候选池
+                #       让语义重排序有机会将相关节点重新排到前面。
+                consult_paths = [p for p in all_paths if any(
+                    n.get("id", "").startswith("qa_") for n in p.nodes
+                )]
+                other_paths = [p for p in all_paths if p not in consult_paths]
+                # 至少保留 top_k*50 个候选（至少 500），保证大关联量场景下 ground truth 不被截断
+                max_candidates = min(len(consult_paths), max(top_k * 50, 500)) if consult_paths else 50
+                if len(consult_paths) >= 5:
+                    paths = consult_paths[:max_candidates]
+                else:
+                    paths = consult_paths + other_paths[:max(5, max_candidates - len(consult_paths))]
+                paths = paths[:max_candidates]
         except Exception as e:
             logger.error(f"临床多跳遍历失败: {e}")
 
@@ -320,7 +410,6 @@ class GraphRAGRetrieval:
                 UNWIND $source_entities as entity_name
                 MATCH (source)
                 WHERE (source.name IS NOT NULL AND source.name CONTAINS entity_name) 
-                   OR (source.title IS NOT NULL AND source.title CONTAINS entity_name) 
                    OR source.nodeId = entity_name
 
                 MATCH (source)-[r*1..{graph_query.max_depth}]-(neighbor)
@@ -421,49 +510,248 @@ class GraphRAGRetrieval:
 
         return query_plans
     
+    def _validate_graph_entities(self, entities: List[str]) -> List[str]:
+        """
+        验证实体是否在 entity_cache 中有匹配。
+        返回经过去重和验证的有效实体列表（空列表 = 全部无效）。
+        """
+        if not entities or not self.entity_cache:
+            return []
+
+        valid = []
+        # 构建 entity_cache 中的文本索引
+        entity_names = []
+        for cid, cached in self.entity_cache.items():
+            name = cached.get("name", "")
+            if name and len(name) >= 2:
+                entity_names.append(name.lower().strip())
+
+        for entity in entities:
+            e_lower = entity.lower().strip()
+            if not e_lower or len(e_lower) < 2:
+                continue
+            # 检查实体名是否在 cache 中存在（子串匹配 | 完全匹配）
+            for cached_name in entity_names:
+                if e_lower in cached_name or cached_name in e_lower:
+                    valid.append(entity)
+                    break
+
+        return list(set(valid))  # 去重
+
+    def _fallback_extract_entities(self, query: str) -> List[str]:
+        """
+        兜底实体提取 — 当 LLM 提取的实体在图中找不到时，
+        直接用 entity_cache 中的实体名对查询文本做子串匹配。
+        """
+        if not self.entity_cache:
+            return []
+
+        query_lower = query.lower().strip()
+        matched = []
+
+        for cid, cached in self.entity_cache.items():
+            name = cached.get("name", "")
+            if not name or len(name) < 2:
+                continue
+            name_lower = name.lower().strip()
+            if name_lower in query_lower:
+                matched.append(name)
+
+        # 按长度降序，优先最长匹配（最精确的实体）
+        matched.sort(key=lambda x: (len(x), x), reverse=True)
+        return matched[:5]
+
+    def _vector_as_supplement(self, query: str, top_k: int) -> List[Document]:
+        """
+        向量补充搜索：从 Milvus 获取语义相似结果，补充图结构检索的盲区。
+
+        当目标 QA 在 Neo4j 中不存在或未被正确关联到疾病节点时，
+        图遍历无法找到它，但向量搜索仍然能通过语义匹配召回。
+        """
+        if not self.milvus_module:
+            return []
+        try:
+            raw = self.milvus_module.similarity_search(query, k=top_k)
+            docs = []
+            seen_ids = set()
+            for r in raw:
+                nid = r.get("metadata", {}).get("node_id", "")
+                if not nid or nid in seen_ids:
+                    continue
+                seen_ids.add(nid)
+                content = r.get("text", "")
+                metadata = r["metadata"]
+                metadata["search_type"] = "graph_vector_supplement"
+                metadata["vector_score"] = r.get("score", 0.0)
+                docs.append(Document(page_content=content, metadata=metadata))
+            logger.info(f"向量补充搜索召回 {len(docs)} 个文档")
+            return docs
+        except Exception as e:
+            logger.warning(f"向量补充搜索失败: {e}")
+            return []
+
+    def _fuse_by_node_id(
+        self,
+        graph_docs: List[Document],
+        vector_docs: List[Document],
+        query: str,
+        top_k: int,
+    ) -> List[Document]:
+        """
+        按 node_id 去重 + 分数融合。
+
+        融合策略（与 _semantic_rerank 一致的权重）:
+          - graph doc: fused = 0.4 * norm_graph + 0.6 * semantic (计算的)
+          - vector doc: fused = 0.3 * 0.5 + 0.7 * vector_score
+          - 同一 node_id 同时出现在 graph + vector 时取 graph 版（保留图结构元数据）
+
+        Returns top_k 个文档。
+        """
+        # 1) 构建 graph 索引
+        graph_map = {}  # node_id -> doc
+        for d in graph_docs:
+            nid = (d.metadata.get("node_id") or "") or d.metadata.get("chunk_id", "")
+            if nid:
+                graph_map[nid] = d
+
+        # 2) 计算 graph docs 的融合分 (复用 _semantic_rerank 的余弦相似度逻辑)
+        if graph_docs:
+            graph_docs = self._semantic_rerank(graph_docs, query)
+            for d in graph_docs:
+                fused = d.metadata.get("fused_score")
+                d.metadata["_fused"] = fused if fused else d.metadata.get("relevance_score", 0.0)
+
+        # 3) 合并 vector docs
+        seen = set()
+        fused_list = []
+
+        # 先处理 graph docs（保留原有评分和融合分）
+        for d in graph_docs:
+            nid = (d.metadata.get("node_id") or "") or d.metadata.get("chunk_id", "")
+            if nid in seen:
+                continue
+            seen.add(nid)
+            fused_list.append((d.metadata.get("_fused", 0.0), d))
+
+        # 再处理 vector docs（只补充 graph 中没有的）
+        if not self.milvus_module:
+            # 没有 embeddings 做余弦打分 → 直接用 vector_score
+            for d in vector_docs:
+                nid = (d.metadata.get("node_id") or "") or d.metadata.get("chunk_id", "")
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                vs = d.metadata.get("vector_score", 0.0)
+                fused = 0.3 * 0.5 + 0.7 * vs  # graph 部分给默认 0.5
+                d.metadata["_fused"] = fused
+                fused_list.append((fused, d))
+        else:
+            # 有 embeddings → 对 vector docs 也做语义重排序
+            vector_reranked = self._semantic_rerank(vector_docs, query)
+            for d in vector_reranked:
+                nid = (d.metadata.get("node_id") or "") or d.metadata.get("chunk_id", "")
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                fused = d.metadata.get("fused_score", 0.0)
+                if not fused:
+                    fused = 0.3 * 0.5 + 0.7 * d.metadata.get("vector_score", 0.0)
+                d.metadata["_fused"] = fused
+                fused_list.append((fused, d))
+
+        # 4) 按融合分降序 → top_k
+        fused_list.sort(key=lambda x: x[0], reverse=True)
+        final = [doc for _, doc in fused_list[:top_k]]
+
+        logger.info(
+            f"图+向量融合完成: graph={len(graph_docs)}, vector={len(vector_docs)}, "
+            f"融合后={len(final)}"
+        )
+        return final
+
     def graph_rag_search(self, query: str, top_k: int = 5) -> List[Document]:
         """
-        图RAG主搜索接口：整合所有图RAG能力
+        图RAG主搜索接口：纯图结构遍历检索
+
+        流程:
+        1. 查询意图理解 → 实体识别
+        2. 多跳图遍历 → 路径提取（大候选池：LIMIT 2000 → 取 top_k*10）
+        3. 路径转文档 → 图结构相关性排序 → 语义重排序
+        4. 返回 top_k 个结果
         """
         logger.info(f"开始图RAG检索: {query}")
-        
+
         if not self.driver:
             logger.warning("Neo4j连接未建立，返回空结果")
             return []
-        
-        # 1. 查询意图理解
-        graph_query = self.understand_graph_query(query)
-        logger.info(f"查询类型: {graph_query.query_type.value}")
-        
-        results = []
-        
+
+        # 1. 实体提取：先字典匹配（最快、最准），无效则 LLM 兜底
+        dict_entities = self._fallback_extract_entities(query)
+        if dict_entities:
+            logger.info(f"✅ 字典匹配提取实体成功: {dict_entities}")
+            graph_query = GraphQuery(
+                query_type=QueryType.ENTITY_RELATION,
+                source_entities=dict_entities,
+                target_entities=[],
+                relation_types=[],
+                max_depth=2,
+            )
+        else:
+            # LLM 提取（最灵活，适合复杂查询）
+            graph_query = self.understand_graph_query(query)
+            logger.info(f"查询类型: {graph_query.query_type.value}")
+
+            # 验证 LLM 提取的实体在图中是否真实存在
+            if graph_query.source_entities:
+                validated = self._validate_graph_entities(graph_query.source_entities)
+                if validated:
+                    graph_query.source_entities = validated
+                    logger.info(f"LLM 实体验证通过: {validated}")
+                else:
+                    logger.warning(
+                        f"LLM 实体 {graph_query.source_entities} 未在图中找到，"
+                        f"尝试直接用原始实体做图遍历"
+                    )
+
+        graph_results = []
+
         try:
-            # 2. 根据查询类型执行不同策略
+            # 2. 图结构检索（纯图遍历，不依赖向量搜索）
             if graph_query.query_type in [QueryType.MULTI_HOP, QueryType.PATH_FINDING]:
-                # 多跳遍历 / 路径查找
-                paths = self.multi_hop_traversal(graph_query)
-                results.extend(self._paths_to_documents(paths, query))
-                
+                paths = self.multi_hop_traversal(graph_query, top_k=top_k, query=query)
+                graph_results.extend(self._paths_to_documents(paths, query))
+
             elif graph_query.query_type in [QueryType.SUBGRAPH, QueryType.CLUSTERING]:
-                # 子图提取 / 聚类查询：都视为“围绕核心实体的局部知识网络”
                 subgraph = self.extract_knowledge_subgraph(graph_query)
-                
-                # 图结构推理
                 reasoning_chains = self.graph_structure_reasoning(subgraph, query)
-                
-                results.extend(self._subgraph_to_documents(subgraph, reasoning_chains, query))
-                
+                graph_results.extend(self._subgraph_to_documents(subgraph, reasoning_chains, query))
+
             elif graph_query.query_type == QueryType.ENTITY_RELATION:
-                # 实体关系查询（可以视为一跳 / 少量跳的路径查询）
-                paths = self.multi_hop_traversal(graph_query)
-                results.extend(self._paths_to_documents(paths, query))
-            
+                paths = self.multi_hop_traversal(graph_query, top_k=top_k, query=query)
+                graph_results.extend(self._paths_to_documents(paths, query))
+
             # 3. 图结构相关性排序
-            results = self._rank_by_graph_relevance(results, query)
-            
-            logger.info(f"图RAG检索完成，返回 {len(results[:top_k])} 个结果")
-            return results[:top_k]
-            
+            graph_results = self._rank_by_graph_relevance(graph_results, query)
+
+            # 4. 语义重排序候选截断：只对 top-N 做 BGE 嵌入（避免全量推理太慢）
+            #    新关键词评分公式已将目标节点排到前列，截断后仍能覆盖
+            rerank_pool = graph_results[:self.max_rerank_candidates]
+            logger.info(f"语义重排序候选: {len(rerank_pool)}/{len(graph_results)} 个文档")
+
+            # 5. 语义重排序（在图结构排序基础上，用嵌入模型余弦相似度微调排序）
+            reranked = self._semantic_rerank(rerank_pool, query)
+
+            # 6. 合并结果：重排序的 top 在前，其余候选按原序接在后面
+            graph_results = reranked + graph_results[self.max_rerank_candidates:]
+
+            # 5. 输出结果
+            returned_ids = [
+                d.metadata.get("node_id", "?")[:20] for d in graph_results[:top_k]
+            ]
+            logger.info(f"图RAG检索完成，返回 {len(graph_results[:top_k])} 个结果")
+            logger.debug(f"返回 node_id 列表: {returned_ids}")
+            return graph_results[:top_k]
+
         except Exception as e:
             logger.error(f"图RAG检索失败: {e}")
             return []
@@ -527,50 +815,201 @@ class GraphRAGRetrieval:
                 reasoning_chains=[]
             )
 
+    def _fetch_consultations(self, node_ids: List[str]) -> Dict[str, Dict]:
+        """批量从 Neo4j 获取 Consultation 完整内容（title/ask/answer/department）"""
+        if not self.driver or not node_ids:
+            return {}
+
+        try:
+            with self.driver.session() as session:
+                result = session.run(
+                    """
+                    UNWIND $node_ids AS nid
+                    MATCH (c:Consultation {nodeId: nid})
+                    RETURN c.nodeId AS node_id, c.title AS title,
+                           c.ask AS ask, c.answer AS answer,
+                           c.department AS department
+                    """,
+                    {"node_ids": node_ids},
+                )
+                consultations = {}
+                for record in result:
+                    consultations[record["node_id"]] = {
+                        "title": record.get("title", "") or "",
+                        "ask": record.get("ask", "") or "",
+                        "answer": record.get("answer", "") or "",
+                        "department": record.get("department", "") or "",
+                    }
+                return consultations
+        except Exception as e:
+            logger.error(f"批量获取 Consultation 失败: {e}")
+            return {}
+
     def _paths_to_documents(self, paths: List[GraphPath], query: str) -> List[Document]:
-        documents = []
+        """
+        将图路径转换为 Document 对象
+        优先提取每条路径中包含的 Consultation 节点的完整 QA 内容；
+        仅当路径不含 Consultation 时才回退到路径描述。
+        """
+        if not paths:
+            return []
+
+        # === 1. 收集所有路径中的 Consultation node_id ===
+        consultation_ids = set()
         for path in paths:
-            path_desc = self._build_path_description(path)
-            medical_name = path.nodes[0].get("name",
-                                             path.nodes[0].get("title", "临床图谱结果")) if path.nodes else "临床图谱结果"
-            doc = Document(
-                page_content=path_desc,
-                metadata={
-                    "search_type": "medical_graph_path",
-                    "path_length": path.path_length,
-                    "relevance_score": path.relevance_score,
-                    "path_type": path.path_type,
-                    "node_count": len(path.nodes),
-                    "relationship_count": len(path.relationships),
-                    "title": medical_name
-                }
-            )
-            documents.append(doc)
+            for node in path.nodes:
+                nid = node.get("id") or node.get("properties", {}).get("nodeId", "")
+                if nid and nid.startswith("qa_"):
+                    consultation_ids.add(nid)
+
+        # === 2. 从 Neo4j 批量获取 Consultation 详情 ===
+        consultation_map = self._fetch_consultations(list(consultation_ids))
+
+        # === 3. 构建 Document 列表 ===
+        documents = []
+        seen_consultation_ids = set()
+        seen_path_descs = set()
+
+        for path in paths:
+            # 提取路径中的疾病/科室名用于标题
+            disease_names = []
+            dept_name = ""
+            for node in path.nodes:
+                labels = node.get("labels", [])
+                if any("Disease" in str(l) for l in labels) and node.get("name"):
+                    disease_names.append(node["name"])
+                if any("Department" in str(l) for l in labels) and node.get("name"):
+                    dept_name = node["name"]
+
+            # --- 优先用路径中的 Consultation 节点生成 Document ---
+            found_consultation = False
+            for node in path.nodes:
+                nid = node.get("id") or node.get("properties", {}).get("nodeId", "")
+                if nid and nid.startswith("qa_") and nid not in seen_consultation_ids:
+                    seen_consultation_ids.add(nid)
+                    consult = consultation_map.get(nid, {})
+                    title = consult.get("title") or node.get("name") or node.get("title") or "医学问答"
+                    ask = consult.get("ask", "")
+                    answer = consult.get("answer", "")
+
+                    if ask and answer:
+                        page_content = f"【{title}】\n问：{ask}\n答：{answer}"
+                    else:
+                        page_content = self._build_path_description(path)
+
+                    metadata = {
+                        "search_type": "medical_graph_consultation",
+                        "node_id": nid,
+                        "chunk_id": f"{nid}_full",
+                        "title": title,
+                        "department": consult.get("department") or dept_name,
+                        "relevance_score": path.relevance_score,
+                        "path_length": path.path_length,
+                        "diseases": disease_names[:5],
+                    }
+                    documents.append(Document(page_content=page_content, metadata=metadata))
+                    found_consultation = True
+                    break  # 每个 path 只取第一个未见的 Consultation
+
+            # --- 回退：该路径没有 Consultation 节点 → 用路径描述 ---
+            if not found_consultation:
+                path_desc = self._build_path_description(path)
+                if path_desc not in seen_path_descs:
+                    seen_path_descs.add(path_desc)
+                    medical_name = (
+                        path.nodes[0].get("name", path.nodes[0].get("title", "临床图谱结果"))
+                        if path.nodes else "临床图谱结果"
+                    )
+                    # ä¸º fallback è·¯å¾æå node_id
+                    node_id = next((n.get("id", "") for n in path.nodes if n.get("id", "").startswith("qa_")), "")
+                    metadata = {
+                        "search_type": "medical_graph_path",
+                        "path_length": path.path_length,
+                        "relevance_score": path.relevance_score,
+                        "title": medical_name,
+                        "diseases": disease_names[:5],
+                        "node_id": node_id,
+                        "chunk_id": f"{node_id}_full" if node_id else "",
+                    }
+                    documents.append(Document(page_content=path_desc, metadata=metadata))
+
         return documents
     
-    def _subgraph_to_documents(self, subgraph: KnowledgeSubgraph, 
+    def _subgraph_to_documents(self, subgraph: KnowledgeSubgraph,
                               reasoning_chains: List[str], query: str) -> List[Document]:
-        """将知识子图转换为Document对象"""
+        """
+        将知识子图转换为 Document 列表。
+
+        优先提取子图中所有 Consultation 节点，为每个生成独立的 QA Document；
+        并补充一张子图描述文档。这样既保留了完整的内容覆盖，也确保每个
+        Consultation 的 node_id 能参与 ground truth 匹配。
+        """
         documents = []
-        
-        # 子图整体描述
+        all_nodes = subgraph.central_nodes + subgraph.connected_nodes
+
+        # 1. 收集子图中所有 Consultation node_id
+        consultation_ids = []
+        for node in all_nodes:
+            if isinstance(node, dict):
+                nid = node.get("nodeId", "")
+                if nid and nid.startswith("qa_"):
+                    consultation_ids.append(nid)
+
+        # 2. 批量获取 Consultation 完整内容 → 每个生成独立 Document
+        if consultation_ids:
+            consultation_map = self._fetch_consultations(list(set(consultation_ids)))
+            seen_ids = set()
+            for nid in consultation_ids:
+                if nid in seen_ids:
+                    continue
+                seen_ids.add(nid)
+                consult = consultation_map.get(nid, {})
+                title = consult.get("title") or "医学问答"
+                ask = consult.get("ask", "")
+                answer = consult.get("answer", "")
+
+                if ask and answer:
+                    page_content = f"【{title}】\n问：{ask}\n答：{answer}"
+                else:
+                    page_content = title
+
+                # 从子图节点中提取疾病/科室信息（用于元数据）
+                disease_names = []
+                for node in all_nodes:
+                    labels = node.get("labels", [])
+                    if any("Disease" in str(l) for l in labels) and node.get("name"):
+                        disease_names.append(node["name"])
+
+                metadata = {
+                    "search_type": "medical_subgraph_consultation",
+                    "node_id": nid,
+                    "chunk_id": f"{nid}_full",
+                    "title": title,
+                    "department": consult.get("department", ""),
+                    "diseases": disease_names[:5],
+                    "relevance_score": 1.0,
+                    "reasoning_chains": reasoning_chains,
+                }
+                documents.append(Document(page_content=page_content, metadata=metadata))
+
+        # 3. 补充子图整体描述（如没有 Consultation 节点则作为兜底）
         subgraph_desc = self._build_subgraph_description(subgraph)
         medical_name = subgraph.central_nodes[0].get("name", subgraph.central_nodes[0].get("title",
                                                                                            "医学子图")) if subgraph.central_nodes else "医学子图"
 
-        doc = Document(
-            page_content=subgraph_desc,
-            metadata={
-                "search_type": "medical_subgraph",
-                "node_count": len(subgraph.connected_nodes),
-                "relationship_count": len(subgraph.relationships),
-                "graph_density": subgraph.graph_metrics.get("density", 0.0),
-                "reasoning_chains": reasoning_chains,
-                "title": medical_name
-            }
-        )
-        documents.append(doc)
-        
+        meta_subgraph = {
+            "search_type": "medical_subgraph",
+            "node_count": len(subgraph.connected_nodes),
+            "relationship_count": len(subgraph.relationships),
+            "graph_density": subgraph.graph_metrics.get("density", 0.0),
+            "reasoning_chains": reasoning_chains,
+            "title": medical_name,
+        }
+        if consultation_ids:
+            meta_subgraph["node_id"] = consultation_ids[0]
+            meta_subgraph["chunk_id"] = f"{consultation_ids[0]}_full"
+        documents.append(Document(page_content=subgraph_desc, metadata=meta_subgraph))
+
         return documents
     
     def _build_path_description(self, path: GraphPath) -> str:
@@ -593,9 +1032,78 @@ class GraphRAGRetrieval:
     
     def _rank_by_graph_relevance(self, documents: List[Document], query: str) -> List[Document]:
         """基于图结构相关性排序"""
-        return sorted(documents, 
-                     key=lambda x: x.metadata.get("relevance_score", 0.0), 
+        return sorted(documents,
+                     key=lambda x: x.metadata.get("relevance_score", 0.0),
                      reverse=True)
+
+    def _semantic_rerank(self, documents: List[Document], query: str) -> List[Document]:
+        """
+        语义重排序：使用嵌入模型对候选文档做向量相似度重排。
+
+        在图结构排序的基础上，引入语义维度——确保与查询文本最相关
+        的 Consultation 节点排到前列，而非仅靠节点度数/路径长度。
+
+        使用融合评分: final = 0.4 * graph_relevance + 0.6 * semantic_similarity
+        """
+        if not documents:
+            return documents
+
+        # 没有嵌入模型时降级为原顺序
+        if not self.milvus_module or not hasattr(self.milvus_module, 'embeddings'):
+            logger.info("语义重排序不可用（无嵌入模型），使用图结构排序结果")
+            return documents
+
+        try:
+            embeddings = self.milvus_module.embeddings
+
+            # 获取查询向量
+            query_vec = embeddings.embed_query(query)
+
+            # 批量获取文档向量
+            doc_texts = []
+            for doc in documents:
+                text = doc.page_content
+                if not text or len(text.strip()) < 5:
+                    text = doc.metadata.get("title", "") or "医学参考"
+                doc_texts.append(text[:512])  # 截断以免超长
+
+            doc_vecs = embeddings.embed_documents(doc_texts)
+
+            # 计算余弦相似度并融合评分
+            def _cosine_sim(a, b):
+                dot = sum(x * y for x, y in zip(a, b))
+                na = math.sqrt(sum(x * x for x in a))
+                nb = math.sqrt(sum(x * x for x in b))
+                return dot / (na * nb) if na > 0 and nb > 0 else 0.0
+
+            scored = []
+            for i, doc in enumerate(documents):
+                semantic_score = _cosine_sim(query_vec, doc_vecs[i])
+                graph_score = doc.metadata.get("relevance_score", 0.0)
+                # 归一化 graph_score 到 [0, 1] 范围（原始分通常 0.5~2.5）
+                norm_graph = min(graph_score / 3.0, 1.0)
+                # 融合评分：0.1 图结构 + 0.9 语义（语义主导排序）
+                fused = 0.1 * norm_graph + 0.9 * semantic_score
+                scored.append((fused, semantic_score, doc))
+
+            # 按融合评分降序
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            re_ranked = []
+            for fused, sem_score, doc in scored:
+                doc.metadata["semantic_score"] = round(sem_score, 4)
+                doc.metadata["fused_score"] = round(fused, 4)
+                re_ranked.append(doc)
+
+            logger.info(
+                f"语义重排序完成: 最高语义分={scored[0][1]:.4f}, "
+                f"最低={scored[-1][1]:.4f}"
+            )
+            return re_ranked
+
+        except Exception as e:
+            logger.warning(f"语义重排序失败，使用图结构排序结果: {e}")
+            return documents
 
     def _analyze_query_complexity(self, query: str) -> float:
         """

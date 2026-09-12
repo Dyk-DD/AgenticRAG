@@ -1,14 +1,20 @@
+import os
+import sys
+
 from neo4j import GraphDatabase
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
+from config import DEFAULT_CONFIG  # noqa: E402
 
 
 def clean_neo4j_database():
     """
     一键清空 Neo4j 图数据库中的所有节点和关系
     """
-    # 这里的配置项与你的 config.py 保持一致
-    uri = "bolt://localhost:8687"
-    user = "neo4j"
-    password = "changeme"  # 如果你修改过密码，请在这里同步修改
+    # 统一走 app/config.py，凭据从环境变量读取，不再硬编码
+    uri = DEFAULT_CONFIG.neo4j_uri
+    user = DEFAULT_CONFIG.neo4j_user
+    password = DEFAULT_CONFIG.neo4j_password
 
     try:
         print(f"🔗 正在连接 Neo4j 数据库 ({uri})...")

@@ -6,6 +6,7 @@
 
 import json
 import logging
+import hashlib
 from typing import List, Dict, Tuple, Any
 from dataclasses import dataclass
 
@@ -99,13 +100,17 @@ class HybridRetrievalModule:
             unique_departments = {}
             consultations = []
 
-            for i, qa in enumerate(qa_pairs):
+            for qa in qa_pairs:
                 dept_name = qa.get('department', '未知科室')
                 if dept_name not in unique_departments:
                     unique_departments[dept_name] = {"node_id": f"dept_{dept_name}", "name": dept_name}
 
+                # 使用与 graph_data_preparation.py 一致的 MD5 哈希 ID
+                unique_str = f"{qa.get('department', '')}_{qa.get('title', '')}_{qa.get('ask', '')}_{qa.get('answer', '')}"
+                node_id = "qa_" + hashlib.md5(unique_str.encode('utf-8')).hexdigest()[:12]
+
                 consultations.append({
-                    "node_id": f"qa_{i}",
+                    "node_id": node_id,
                     "title": qa.get('title', ''),
                     "ask": qa.get('ask', ''),
                     "answer": qa.get('answer', ''),
