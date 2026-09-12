@@ -187,7 +187,15 @@ services:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:?请在 .env 中填入 Cloudflare Tunnel token}
     # 镜像的 ENTRYPOINT 已是 ["cloudflared","--no-autoupdate"]，所以这里不再
     # 重复 --no-autoupdate，也不会触发容器内自更新重启。
-    command: tunnel run
+    #
+    # --protocol http2：强制走 TCP 443，不用默认的 QUIC（UDP 7844）。
+    # cloudflared 默认 QUIC，但国内 ISP 普遍对长连接 UDP 限速/丢包，实测表现为
+    # 隧道每约 60 秒就 "no recent network activity" 断一次再重注册；断开期间
+    # Cloudflare 边缘对访客返回 502，站点看起来是随机的时通时断。
+    # 同一时刻测 TCP 443 到边缘节点（198.41.192.x / 198.41.200.x）全部可达，
+    # 所以换成 TCP 是稳的。若将来 http2 也不稳，可再加 --edge-ip-version 4
+    # 排除 IPv6 路由问题。
+    command: tunnel run --protocol http2
     depends_on:
       api:
         # 等 api 真正健康再连：否则隧道会先接上一个还没开始监听的源，
