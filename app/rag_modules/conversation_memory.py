@@ -8,6 +8,7 @@
 
 import logging
 import os
+import re
 import time
 import hashlib
 import json
@@ -19,6 +20,15 @@ from typing import List, Dict, Any, Optional, Tuple
 from pymilvus import DataType, CollectionSchema, FieldSchema
 
 logger = logging.getLogger(__name__)
+
+# 会被拼进 Milvus 过滤表达式的值（session_id / client_id）必须只含这些字符。
+# 当前两者都由服务端生成（sess_<ts>_<hex> / p_<hex>），本来就不可伪造；
+# 这道校验是防止将来 ID 生成规则改用用户输入后，字符串拼接变成注入点。
+_SAFE_FILTER_RE = re.compile(r"[A-Za-z0-9_\-]{1,100}")
+
+
+def _is_safe_filter_value(value: str) -> bool:
+    return bool(value) and bool(_SAFE_FILTER_RE.fullmatch(value))
 
 
 @dataclass
@@ -33,6 +43,9 @@ class ConversationTurn:
     complexity_score: float
     disease_entities: List[str] = field(default_factory=list)
     department: str = ""
+    # 归属患者。语义记忆靠它做隔离——没有它就等于跨患者召回，
+    # 这是"病历串号"级别的缺陷，所以默认空串时必须拒绝召回（fail-closed）。
+    client_id: str = ""
 
 
 @dataclass
@@ -60,10 +73,16 @@ class ConversationMemory:
         self._summary_done = False
 
         # WAL（Write-Ahead Log）：崩溃恢复
-        self._wal_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "data", ".memory_wal.jsonl"
+        # 必须是三层 dirname。本文件在 app/rag_modules/ 下，比 app/qa_database.py
+        # 深一层，所以要多退一级才能回到仓库根（容器里是 /app），再拼 data 才
+        # 对得上 rag_state 卷挂载的 /app/data。
+        # 只退两级会得到 /app/app/data：容器里该目录不存在，而 /app/app 属 root，
+        # 非 root 的 appuser 建不出来，WAL 会静默失效 —— 只在日志里留一行
+        # WARNING，功能表面看却正常，崩溃时才会发现未刷新的记忆丢了。
+        _root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         )
+        self._wal_path = os.path.join(_root, "data", ".memory_wal.jsonl")
         self._recover_from_wal()
 
     def initialize(self):
@@ -96,10 +115,20 @@ class ConversationMemory:
 
             collection_name = self.config.memory_milvus_collection
             if self.milvus_module.client.has_collection(collection_name):
-                self.milvus_module.client.load_collection(collection_name)
-                self._collection_ready = True
-                logger.info(f"Milvus 记忆集合 {collection_name} 已加载")
-                return
+                # 老版本的集合没有 client_id 字段，语义召回就无法按患者隔离
+                # （等于跨患者召回病历）。这种集合直接删掉重建：里面只是派生
+                # 缓存，丢掉不影响知识库，而留着就是一个持续泄漏源。
+                if not self._has_client_id_field(collection_name):
+                    logger.warning(
+                        f"Milvus 记忆集合 {collection_name} 缺少 client_id 字段"
+                        f"（无法隔离患者），删除重建"
+                    )
+                    self.milvus_module.client.drop_collection(collection_name)
+                else:
+                    self.milvus_module.client.load_collection(collection_name)
+                    self._collection_ready = True
+                    logger.info(f"Milvus 记忆集合 {collection_name} 已加载")
+                    return
 
             fields = [
                 FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=150, is_primary=True),
@@ -107,6 +136,8 @@ class ConversationMemory:
                 FieldSchema(name="question", dtype=DataType.VARCHAR, max_length=5000),
                 FieldSchema(name="answer", dtype=DataType.VARCHAR, max_length=8000),
                 FieldSchema(name="session_id", dtype=DataType.VARCHAR, max_length=100),
+                # 患者归属。语义召回和删除都按它过滤，是记忆隔离的唯一依据。
+                FieldSchema(name="client_id", dtype=DataType.VARCHAR, max_length=100),
                 FieldSchema(name="strategy", dtype=DataType.VARCHAR, max_length=50),
                 FieldSchema(name="department", dtype=DataType.VARCHAR, max_length=100),
                 FieldSchema(name="disease_entities", dtype=DataType.VARCHAR, max_length=2000),
@@ -127,6 +158,12 @@ class ConversationMemory:
                 metric_type="COSINE",
                 params={"M": 16, "efConstruction": 200},
             )
+            # 标量索引不是可选项：召回要按 client_id 过滤、删除要按 session_id
+            # 过滤，没有索引就是每次全表扫描。INVERTED 需要 Milvus >= 2.4。
+            for scalar_field in ("client_id", "session_id"):
+                index_params.add_index(
+                    field_name=scalar_field, index_type="INVERTED"
+                )
             self.milvus_module.client.create_index(
                 collection_name=collection_name, index_params=index_params
             )
@@ -136,6 +173,17 @@ class ConversationMemory:
 
         except Exception as e:
             logger.warning(f"Milvus 记忆集合初始化失败: {e}")
+
+    def _has_client_id_field(self, collection_name: str) -> bool:
+        """判断集合是否已经带 client_id（用于识别需要重建的老集合）"""
+        try:
+            desc = self.milvus_module.client.describe_collection(collection_name)
+            return any(f.get("name") == "client_id" for f in desc.get("fields", []))
+        except Exception as e:
+            # 判不出来时保守地当作"没有"→ 重建。宁可重建一个空集合，
+            # 也不要因为探测失败而继续用一个无法隔离患者的集合。
+            logger.warning(f"探测集合 {collection_name} 字段失败，按需重建处理: {e}")
+            return False
 
     # ==================== Session Lifecycle ====================
 
@@ -177,6 +225,56 @@ class ConversationMemory:
 
         logger.info(f"临床会话已关闭: {session_id}")
 
+    def delete_session_memory(self, session_id: str) -> Dict[str, bool]:
+        """把某会话从所有记忆存储里抹掉：Milvus 语义记忆 + Neo4j 图谱记忆。
+
+        **必须在 close_session() 之后调用。** close_session 会把 _pending_flush
+        里的轮次写进 Milvus 和 Neo4j，先删再 flush 等于白删 —— 这正是原来的
+        顺序问题（旧代码先删 Neo4j 再 close，Milvus 从来没被删过，而且刷新回来
+        的轮次会永久留在里面）。
+
+        返回每个存储的删除是否成功。调用方必须检查：某一个失败就意味着
+        "用户以为删干净了，其实还有副本"。
+        """
+        result = {"milvus": False, "neo4j": False}
+        if not session_id or not _is_safe_filter_value(session_id):
+            logger.warning(f"session_id 非法，拒绝删除记忆: {session_id!r}")
+            return result
+
+        # 1. Milvus 语义记忆
+        if self._collection_ready and self.milvus_module.client:
+            try:
+                self.milvus_module.client.delete(
+                    collection_name=self.config.memory_milvus_collection,
+                    filter=f'session_id == "{session_id}"',
+                )
+                result["milvus"] = True
+                logger.info(f"已删除 Milvus 中的会话记忆: {session_id}")
+            except Exception as e:
+                logger.warning(f"删除 Milvus 会话记忆失败: {e}")
+        else:
+            # 集合没就绪说明本来就没写过，视为已达成
+            result["milvus"] = True
+
+        # 2. Neo4j 图谱记忆
+        if self._neo4j_ready and self.driver:
+            try:
+                with self.driver.session() as s:
+                    s.run(
+                        "MATCH (ses:Session {session_id: $sid}) "
+                        "OPTIONAL MATCH (ses)-[:CONTAINS]->(t:Turn) "
+                        "DETACH DELETE t, ses",
+                        sid=session_id,
+                    )
+                result["neo4j"] = True
+                logger.info(f"已删除 Neo4j 中的会话记忆: {session_id}")
+            except Exception as e:
+                logger.warning(f"删除 Neo4j 会话记忆失败: {e}")
+        else:
+            result["neo4j"] = True
+
+        return result
+
     # ==================== Write-Ahead Log (崩溃恢复) ====================
 
     def _wal_append(self, turn: ConversationTurn):
@@ -195,6 +293,9 @@ class ConversationMemory:
                     "complexity_score": turn.complexity_score,
                     "disease_entities": turn.disease_entities,
                     "department": turn.department,
+                    # 落盘必须带上归属：恢复时不带 client_id 的话，这些记忆就
+                    # 变成了无主数据，既不能按患者召回也不能按患者删除。
+                    "client_id": turn.client_id,
                 }, ensure_ascii=False) + '\n')
         except Exception as e:
             logger.warning(f"WAL 写入失败: {e}")
@@ -230,6 +331,10 @@ class ConversationMemory:
                         complexity_score=data.get("complexity_score", 0.0),
                         disease_entities=data.get("disease_entities", []),
                         department=data.get("department", ""),
+                        # 老 WAL 没有这个键（升级前写入的），取不到就是空串；
+                        # 这些记忆因此不会被任何患者召回 —— fail-closed，
+                        # 宁可丢掉一条无主的记忆，也不要让它跨患者出现。
+                        client_id=data.get("client_id", ""),
                     )
                     recovered.append(turn)
 
@@ -252,6 +357,7 @@ class ConversationMemory:
         strategy: str = "unknown",
         complexity: float = 0.0,
         extracted_entities: Optional[Dict[str, Any]] = None,
+        client_id: str = "",
     ):
         if not self.config.memory_enabled:
             return
@@ -267,6 +373,9 @@ class ConversationMemory:
             complexity_score=complexity,
             disease_entities=extracted_entities.get("diseases", []) if extracted_entities else [],
             department=extracted_entities.get("department", "") if extracted_entities else "",
+            # 必须随每条记忆一起落库：没有归属的记忆召回时无法隔离，
+            # 也无法在患者删除会话时被一并清除。
+            client_id=client_id,
         )
 
         self.buffer.append(turn)
@@ -381,6 +490,7 @@ class ConversationMemory:
                         "question": t.question[:5000],
                         "answer": t.answer[:8000],
                         "session_id": t.session_id,
+                        "client_id": t.client_id,
                         "strategy": t.strategy,
                         "department": t.department,
                         "disease_entities": ", ".join(t.disease_entities)[:2000],
@@ -429,7 +539,7 @@ class ConversationMemory:
 
     # ==================== Memory Retrieval ====================
 
-    def retrieve_memory_context(self, question: str, session_id: str) -> str:
+    def retrieve_memory_context(self, question: str, session_id: str, client_id: str = "") -> str:
         """
         多源记忆融合检索（修复版）
 
@@ -452,7 +562,7 @@ class ConversationMemory:
         if graph_ctx:
             parts.append(("graph", graph_ctx))
 
-        similar = self._semantic_recall(question, session_id)
+        similar = self._semantic_recall(question, session_id, client_id)
         if similar:
             parts.append(("semantic", similar))
 
@@ -526,8 +636,19 @@ class ConversationMemory:
 
         return "\n".join(lines)
 
-    def _semantic_recall(self, question: str, session_id: str) -> str:
+    def _semantic_recall(self, question: str, session_id: str, client_id: str = "") -> str:
         if not self._collection_ready:
+            return ""
+
+        # fail-closed：没有归属就召回不了任何东西，直接返回空。
+        # 曾经的实现不带任何过滤条件，搜的是整个集合 —— 于是 A 患者的问答
+        # 会作为「历史相似病例」出现在 B 患者的回答里（病历串号），
+        # 而且患者删掉的历史也照样被召回。宁可少一层召回，也不能跨患者。
+        if not client_id:
+            logger.warning("语义记忆召回缺少 client_id，跳过（避免跨患者召回）")
+            return ""
+        if not _is_safe_filter_value(client_id):
+            logger.warning("client_id 含非法字符，拒绝语义记忆召回")
             return ""
 
         try:
@@ -538,6 +659,10 @@ class ConversationMemory:
                 collection_name=collection_name,
                 data=[query_vector],
                 anns_field="vector",
+                # 只召回本患者自己的历史。用 client_id 而不是 session_id：
+                # 这层的价值就是"跨会话"回忆同一个患者的既往提问，按 session
+                # 过滤会退化成与短期缓冲重复。
+                filter=f'client_id == "{client_id}"',
                 limit=self.config.memory_top_k * 2,
                 output_fields=["question", "answer", "session_id", "disease_entities", "strategy"],
                 search_params={"metric_type": "COSINE", "params": {"ef": 64}},

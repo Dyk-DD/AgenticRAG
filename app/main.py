@@ -33,6 +33,12 @@ from rag_modules.conversation_memory import ConversationMemory
 # 加载环境变量
 load_dotenv(override=True)
 
+# CLI（本机单操作者）使用的记忆归属。语义记忆召回按 client_id 隔离，CLI 没有
+# 患者概念，给它一个固定身份，这样本地调用仍能跨会话回忆自己的历史，同时
+# 与任何患者的记忆互不可见。
+CLI_CLIENT_ID = "local_cli"
+
+
 class ClinicalDecisionSystem:
     """
     临床决策与辅助系统
@@ -79,11 +85,13 @@ class ClinicalDecisionSystem:
 
         # 1. 医疗数据准备模块 - 新增传入 config 和 llm_client
         self.data_module = MedicalDataPreparationModule(
-            config=self.config,           # <-- 新增
+            config=self.config,
             csv_dir=self.config.medical_csv_dir,
             uri=self.config.neo4j_uri,
             user=self.config.neo4j_user,
-            password=self.config.neo4j_password
+            password=self.config.neo4j_password,
+            llm_client=self.llm_client,
+            use_ner=self.config.ner_enabled,
         )
 
         # 2. Milvus 向量索引构建模块
@@ -97,7 +105,10 @@ class ClinicalDecisionSystem:
         # 3. 临床文本生成集成模块
         self.generation_module = GenerationIntegrationModule(
             model_name=self.config.llm_model,
-            temperature=0.1  # 医疗场景保持低温度以防幻觉
+            temperature=0.1,  # 医疗场景保持低温度以防幻觉
+            # 必须显式传：该类没有 self.config，漏传就会静默退回构造函数默认值，
+            # 于是改 config.max_tokens 完全不生效（曾经就是这样）。
+            max_tokens=self.config.max_tokens
         )
 
         # 4. 检索模块实例化
@@ -110,7 +121,8 @@ class ClinicalDecisionSystem:
 
         self.graph_rag_retrieval = GraphRAGRetrieval(
             config=self.config,
-            llm_client=self.llm_client
+            llm_client=self.llm_client,
+            milvus_module=self.index_module,  # 用于语义重排序
         )
 
         # 5. 智能医疗查询路由器
@@ -144,6 +156,8 @@ class ClinicalDecisionSystem:
             logger.info("Neo4j 和 Milvus 数据已同步，跳过索引构建")
             self.data_module.load_csv_data()
             chunks = self.data_module.build_chunks()
+            # 加载已存在的 Milvus 集合到内存（不重建）
+            self.index_module.load_collection()
         else:
             self.data_module.load_csv_data()
 
@@ -220,12 +234,24 @@ class ClinicalDecisionSystem:
             departments = list(stats['departments_distribution'].keys())[:10]
             print(f"   核心科室: {', '.join(departments)}")
 
-    def ask_question_with_routing(self, question: str, stream: bool = False, explain_routing: bool = False):
+    def ask_question_with_routing(
+        self,
+        question: str,
+        stream: bool = False,
+        explain_routing: bool = False,
+        session_id: Optional[str] = None,
+    ):
         """
         智能临床问答：自动选择最佳检索与推演策略
+
+        session_id: 本次问诊所属会话。CLI 单用户场景传 None 时沿用
+        self.current_session_id；REST API 必须显式传入，否则并发用户会
+        共用这一个实例字段，导致问答写进他人的会话。
         """
         if not getattr(self, 'system_ready', False):
             raise ValueError("系统未就绪，请先构建临床知识库")
+
+        sid = session_id or self.current_session_id
 
         print(f"\n[患者/医生] 提问: {question}")
 
@@ -241,10 +267,10 @@ class ClinicalDecisionSystem:
         try:
             # 0. 召回对话记忆上下文
             memory_context = ""
-            if self.memory_module and self.current_session_id:
+            if self.memory_module and sid:
                 print("[记忆] 正在召回对话记忆...")
                 memory_context = self.memory_module.retrieve_memory_context(
-                    question, self.current_session_id
+                    question, sid, CLI_CLIENT_ID
                 )
                 if memory_context:
                     print("   [OK] 记忆上下文已加载")
@@ -295,20 +321,22 @@ class ClinicalDecisionSystem:
                 result = self.generation_module.generate_adaptive_answer(question, relevant_docs, memory_context)
 
             # 5. 记录本轮对话到记忆
-            if self.memory_module and self.current_session_id:
+            if self.memory_module and sid:
                 extracted = self.memory_module.extract_referenced_entities(question, str(result))
                 self.memory_module.record_turn(
-                    session_id=self.current_session_id,
+                    session_id=sid,
                     question=question,
                     answer=str(result),
                     strategy=analysis.recommended_strategy.value if analysis else "unknown",
                     complexity=analysis.query_complexity if analysis else 0.0,
-                    extracted_entities=extracted
+                    extracted_entities=extracted,
+                    client_id=CLI_CLIENT_ID
                 )
 
             # 6. 性能统计
             end_time = time.time()
             print(f"\n[耗时] 诊断处理完成，耗时: {end_time - start_time:.2f}秒")
+            # print(f"消耗的tokens: {self.generation_module.token_usage}")
 
             return result, analysis
 
