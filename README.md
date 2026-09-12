@@ -1,4 +1,4 @@
-# Agentic-RAG：图谱增强检索临床辅助决策系统
+# Agentic-RAG：图谱增强检索智能问答系统
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue)
 ![Neo4j](https://img.shields.io/badge/Neo4j-5.18-green)

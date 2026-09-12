@@ -9,6 +9,8 @@ import hmac
 import json
 import logging
 import os
+import re
+import sqlite3
 import sys
 import threading
 import time
@@ -24,7 +26,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from main import ClinicalDecisionSystem
-from qa_database import QADatabase
+from qa_database import (
+    MAX_EMAIL_LEN,
+    MAX_PASSWORD_LEN,
+    MIN_PASSWORD_LEN,
+    QADatabase,
+    clean_title,
+)
 from security import (
     ACCESS_SUBJECT,
     ACCESS_TTL,
@@ -238,39 +246,60 @@ def _get_patient(req: FastAPIRequest) -> str:
         raise HTTPException(status_code=401, detail="患者身份无效或已过期，请重新登录")
     return subject
 
-# ── Patient endpoints ─────────────────────────────────────────────────
+# ── Account endpoints ─────────────────────────────────────────────────
+#
+# 账号叠在全局访问密码之后：中间件先验 Bearer 访问令牌，这里再验账号密码。
+# 保留全局门是有意的 —— 它是不发验证邮件的前提下唯一能挡住陌生人烧
+# DeepSeek 额度的一层。
+#
+# 返回体沿用 patient_token 这个名字，令牌载荷也仍然是 issue_token(patient_id)，
+# 这样 _get_patient 与全部 client_id 数据隔离逻辑一行都不用改。
+#
+# 不发邮件：没有验证码、没有密码重置。忘记密码只能靠管理员跑
+# scripts/migrate_sessions_to_account.py 改挂到新账号，前端要把这点说清。
 
-class PatientRegister(BaseModel):
-    name: str
-    access_code: str = ""
+# 够用即可：不发信，所以只用来拦手误，不做 RFC 5322，也不查 MX
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-class PatientLogin(BaseModel):
-    patient_id: str
-    access_code: str = ""
+class AccountRegister(BaseModel):
+    email: str
+    password: str
+    name: str = ""
 
-@app.post("/api/patients/register")
-def register_patient(body: PatientRegister):
-    db = get_qa_db()
-    if not body.name.strip():
-        raise HTTPException(status_code=400, detail="姓名不能为空")
-    patient = db.register_patient(body.name.strip(), body.access_code.strip())
-    # access_code 是服务端生成时唯一一次明文可见的时机，需前端提示保存
-    patient["patient_token"] = issue_token(patient["patient_id"], PATIENT_TTL)
-    return patient
+class AccountLogin(BaseModel):
+    email: str
+    password: str
 
-@app.get("/api/patients")
-def list_patients():
-    db = get_qa_db()
-    return {"patients": db.list_patients()}
+def _normalize_email(raw: str) -> str:
+    return (raw or "").strip().lower()
 
-@app.post("/api/patients/login")
-def login_patient(body: PatientLogin):
-    db = get_qa_db()
-    patient = db.verify_patient(body.patient_id, body.access_code)
-    if not patient:
-        raise HTTPException(status_code=403, detail="患者ID或访问码错误")
-    patient["patient_token"] = issue_token(patient["patient_id"], PATIENT_TTL)
-    return patient
+@app.post("/api/accounts/register", status_code=201)
+def register_account(body: AccountRegister):
+    email = _normalize_email(body.email)
+    if len(email) > MAX_EMAIL_LEN or not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="邮箱格式不正确")
+    if not (MIN_PASSWORD_LEN <= len(body.password) <= MAX_PASSWORD_LEN):
+        raise HTTPException(
+            status_code=400,
+            detail=f"密码长度需在 {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} 个字符之间",
+        )
+    name = (body.name or "").strip() or email.split("@", 1)[0]
+    try:
+        account = get_qa_db().register_account(email, name[:40], body.password)
+    except sqlite3.IntegrityError:
+        # 唯一索引是防重复注册的唯一防线（先查后插有竞态窗口）
+        raise HTTPException(status_code=409, detail="该邮箱已注册")
+    account["patient_token"] = issue_token(account["patient_id"], PATIENT_TTL)
+    return account
+
+@app.post("/api/accounts/login")
+def login_account(body: AccountLogin):
+    # 邮箱与密码错误返回同一个 403，不区分二者，避免枚举已注册邮箱
+    account = get_qa_db().verify_account(_normalize_email(body.email), body.password)
+    if not account:
+        raise HTTPException(status_code=403, detail="邮箱或密码错误")
+    account["patient_token"] = issue_token(account["patient_id"], PATIENT_TTL)
+    return account
 
 
 def build_retrieved_docs_json(documents) -> str:
@@ -542,6 +571,30 @@ def get_session_detail(session_id: str, request: FastAPIRequest):
     if detail is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     return detail
+
+
+class SessionRename(BaseModel):
+    title: str
+
+
+@app.put("/api/sessions/{session_id}")
+def rename_session(session_id: str, body: SessionRename, request: FastAPIRequest):
+    cid = _get_patient(request)
+    db = get_qa_db()
+
+    # 归属校验必须前置，与下面的 DELETE 同一惯例。改名不碰记忆存储，所以这道
+    # 预检就是全部防线——漏了就是「任何登录用户可改任何会话名」，而 session_id
+    # 是可猜的（sess_<unix秒>_<6位十六进制>）。
+    if db.get_session_detail(session_id, client_id=cid) is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    title = clean_title(body.title)
+    if not title:
+        raise HTTPException(status_code=400, detail="标题不能为空")
+
+    if not db.set_session_title(session_id, title, client_id=cid):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"session_id": session_id, "title": title}
 
 
 @app.delete("/api/sessions/{session_id}")
