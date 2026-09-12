@@ -1,4 +1,12 @@
-# Python
+# ══════════════════════════════════════════════════════════════════
+#  Agentic-RAG .gitignore
+#
+#  注意：.gitignore 只对**未被跟踪**的文件生效。一个文件一旦进过版本
+#  控制，往这里加规则不会让它脱离，必须显式 `git rm -r --cached <路径>`
+#  （只动索引，磁盘文件原样保留）。models/ 曾踩过这个坑。
+# ══════════════════════════════════════════════════════════════════
+
+# ── Python ────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -20,29 +28,35 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
+# ── 虚拟环境 ──────────────────────────────────────────────────────
 venv/
+.venv/
 ENV/
+env/
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Environment variables
+# ── 环境变量与凭证 ────────────────────────────────────────────────
 .env
 .env.local
-.env.example
+.env.*.local
+# .env.example 不在此列：它只含键名不含值，需要提交供他人克隆后参照
+*.key
+*.secret
+*.pem
 
-# Logs
+# ── 日志 ──────────────────────────────────────────────────────────
 *.log
 logs/
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# ── Jupyter ───────────────────────────────────────────────────────
+.ipynb_checkpoints/
 
-# OS generated files
+# ── 操作系统 ──────────────────────────────────────────────────────
 .DS_Store
 .DS_Store?
 ._*
@@ -51,30 +65,57 @@ logs/
 ehthumbs.db
 Thumbs.db
 
-# Docker volumes (Milvus/MinIO/etcd runtime data)
-volumes/
+# ── 模型文件 ──────────────────────────────────────────────────────
+# 本地模型目录整目录不传（bge-base-zh-v1.5 / bge-m3 / TCMNER 合计约 5G）。
+# 克隆后用 `python scripts/download_model.py` 拉取，README 部署一节有说明。
+models/
+# 权重与二进制词表：防的是模型被放在 models/ 之外的情况
+*.pt
+*.pth
+*.bin
+*.onnx
+*.onnx_data
+*.safetensors
+*.ckpt
+*.h5
+*.msgpack
+*.tflite
+*.sentencepiece.bpe.model
+Constant_7_attr__value
 
-# Data files
+# ── 数据文件 ──────────────────────────────────────────────────────
+# data/ 约 1.1G：raw 原始医学数据、neo4j 运行时库、processed 中间产物
 data/
+# SQLite 库及其 WAL/SHM 与备份（含患者问答记录，属个人数据）
+*.db
+*.db-wal
+*.db-shm
+*.db.bak*
 
-# Neo4j runtime data
-data/neo4j/
+# ── 本地资料 ──────────────────────────────────────────────────────
+# 面试准备与技术复盘笔记，含个人求职内容
+docs/
 
-# Model binary files
-models/**/pytorch_model.bin
-models/**/model.onnx
-models/**/model.onnx_data
-models/**/sentencepiece.bpe.model
-models/**/Constant_7_attr__value
-
-# Cache
-.cache/
-.cache/modelscope/
-.cargo
-
-# Frontend (separate repo -> Dyk-DD.github.io)
+# ── 前端（独立仓库 -> Dyk-DD.github.io）────────────────────────────
 frontend/
+node_modules/
 
-# LLM API keys
-*.key
-*.secret
+# ── Docker ───────────────────────────────────────────────────────
+# Milvus / MinIO / etcd 运行时卷
+volumes/
+# 本机调试用的 compose 覆盖文件（给 api 加 127.0.0.1:8000 端口）。
+# 不进版本控制：主 compose 文件刻意不发布任何端口，公网只走隧道。
+docker-compose.override.yml
+
+# ── 评估与策略对比的产物 ──────────────────────────────────────────
+# 只挡产物，不挡代码：evaluate.py / strategy_comparison/*.py 等脚本要提交。
+# 报告内含 system_info（连接配置、库统计），历史上曾把 neo4j 密码原样
+# 写进 JSON，因此一律不纳入版本控制。
+scripts/**/*_report.json
+scripts/**/evaluation_report*.json
+scripts/strategy_comparison/*.txt
+scripts/**/comparison_summary.txt
+# 采样的测试集（可由 sample_testset.py 重新生成）
+scripts/**/sampled_*.csv
+# 排障时的一次性脚本
+scripts/strategy_comparison/debug_*.py
