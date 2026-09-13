@@ -24,6 +24,24 @@ MIN_PASSWORD_LEN = 8
 MAX_PASSWORD_LEN = 128
 MAX_EMAIL_LEN = 254
 
+# 会话分享。
+# token 是**能力凭证**：拿到链接即可读，不走访问密码，所以熵必须够 ——
+# token_urlsafe(32) 是 32 字节随机（≈43 个路径安全字符，256 位），
+# 暴力枚举不可行。刻意不用 security.issue_token 那套 HMAC：它的 claims 只有
+# {sub, iat, exp} 且无状态，签出去就撤不回来（除非换 SECRET_KEY，那会一次性
+# 吊销全站所有人的访问令牌），而我们这里必须能撤销。
+SHARE_TOKEN_BYTES = 32
+# 一次分享最多带多少轮。上限是给公开读接口的响应体封顶，不是产品约束。
+SHARE_MAX_TURNS = 50
+# 分享内容里保留的字段。**这是白名单，不是「顺手少拿几个」**：
+# 分享行是一个公开服务物，写进去的东西等价于已经公开了一半。
+#   - retrieved_docs 不带 —— 它存的是 chunk_id / node_id / relevance_score
+#     这类知识库内部标识，读者用不上，却能用来枚举探测语料结构；而且它是
+#     schema 不受控的 JSON blob，将来 build_retrieved_docs_json 里加字段会
+#     自动出现在所有已发出的公开链接里。
+#   - routing_reasoning 不带 —— 暴露内部推理依据与提示链。
+SHARE_TURN_FIELDS = ("turn_index", "question", "answer", "timestamp", "strategy", "complexity")
+
 # 邮箱验证码。真正的防猜测约束是「TTL × 尝试上限 × 每邮箱发信上限」这三者的
 # 乘积，不是码空间本身（6 位只有 10^6 种）。详见 consume_email_code。
 EMAIL_CODE_TTL_SECONDS = 600
@@ -158,9 +176,13 @@ class QADatabase:
                 CREATE INDEX IF NOT EXISTS idx_qa_client ON qa_records(client_id)
             """)
             # Migrations
+            # pinned_at 沿用本循环「一律 TEXT DEFAULT ''」的惯例：空串 = 未置顶，
+            # 非空 = 置顶时刻的 YYYY-MM-DDTHH:MM:SS。不用 NULL 是因为本表所有
+            # 迁移列都读成空串，混进一种新的空值语义会让每个 COALESCE 都要重想。
             for col, tbl in [
                 ("retrieved_docs", "qa_records"), ("client_id", "sessions"), ("client_id", "qa_records"),
                 ("title", "sessions"),
+                ("pinned_at", "sessions"),
                 ("email", "patients"), ("password_salt", "patients"), ("password_hash", "patients"),
             ]:
                 try:
@@ -229,6 +251,46 @@ class QADatabase:
             except (sqlite3.OperationalError, sqlite3.IntegrityError):
                 logger.exception("创建验证码索引失败，重发将退化为仅应用层作废旧码")
 
+            # 会话分享。建表位置是**承重**的：必须排在下面那段旧患者批量清理
+            # （它按 client_id 删数据，本次也加了 DELETE FROM shares）之前。
+            # 那段清理没有 try 包裹，表不存在时抛的 OperationalError 会一路穿过
+            # _init_schema → QADatabase() → get_qa_db()（那里没有 try），
+            # 变成每个请求 500，配合 restart: unless-stopped 就是崩溃循环。
+            #
+            # turns 存的是**内容快照**（JSON 数组），不是 turn_index 引用。
+            # 两条理由，都不是「防删除」：
+            #   1. 公开读取路径不能碰按 client_id 隔离的 qa_records。那条表唯一
+            #      的读取入口 get_session_detail 必须带 client_id，而公开端点没有
+            #      client_id 可带 —— 存引用就意味着要新写一条「只按 session_id 取
+            #      qa_records」的查询，那正是本仓库反复用注释防守的东西。
+            #   2. 分享必须对之后发生的事免疫：会话会继续追加轮次、标题会被改名，
+            #      存引用的话分享页看到的永远是「当前会话」，与分享那一刻漂移。
+            #
+            # 有效语义 = min(主动撤销, 会话被删)。级联删除不是与本设计矛盾，
+            # 而是它的必要补丁 —— delete_session 承诺「删了就没有」，留一条公开
+            # 可读的快照就是直接违反那个承诺，而且用户没有任何入口能发现。
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS shares (
+                    token TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    turns TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            # 刻意不写 FOREIGN KEY(session_id) REFERENCES sessions(id)：
+            # _connect 只开了 WAL，没有 PRAGMA foreign_keys=ON，SQLite 默认**不**
+            # 强制外键 —— 写了不生效，还让下一个人以为级联删除是自动的。
+            # 级联由 delete_session 与下面的旧患者清理显式执行，这个索引是给它们用的。
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_shares_session ON shares(session_id)"
+                )
+            except (sqlite3.OperationalError, sqlite3.IntegrityError):
+                logger.exception("创建 shares 索引失败，级联撤销将退化为全表扫描")
+
             try:
                 _prune_email_codes(conn)
             except sqlite3.Error:
@@ -250,6 +312,10 @@ class QADatabase:
             ]
             for pid in legacy_ids:
                 conn.execute("DELETE FROM qa_records WHERE client_id = ?", (pid,))
+                # ⚠️ 这条不走 delete_session，所以它的级联也得在这里补一份。
+                # 漏了不报错、不崩，只是被清掉的旧患者留下的公开分享链接会继续
+                # 服役 —— 静默的隐私事故，用户没有任何入口能发现。
+                conn.execute("DELETE FROM shares WHERE client_id = ?", (pid,))
                 conn.execute("DELETE FROM sessions WHERE client_id = ?", (pid,))
                 conn.execute("DELETE FROM patients WHERE id = ?", (pid,))
             if legacy_ids:
@@ -517,15 +583,24 @@ class QADatabase:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT s.id, s.created_at, s.closed_at, COALESCE(s.title, '') AS title, "
+                "COALESCE(s.pinned_at, '') AS pinned_at, "
                 "COUNT(q.id) AS turn_count "
                 "FROM sessions s LEFT JOIN qa_records q ON s.id = q.session_id "
                 "WHERE s.client_id = ? "
                 # created_at 只精确到秒，同一秒建的两条会话顺序不定，配合下面的
                 # LIMIT 会让会话在两次调用之间换位甚至被挤掉，所以用 id 兜底
-                "GROUP BY s.id ORDER BY s.created_at DESC, s.id DESC LIMIT ?",
+                "GROUP BY s.id ORDER BY "
+                # 置顶组整体在前。COALESCE 不能省：迁移列在旧行上是 NULL，
+                # 而 NULL != '' 的结果是 NULL（不是 1），整个 CASE 会塌成 NULL。
+                "(COALESCE(s.pinned_at, '') != '') DESC, "
+                # ⚠️ 置顶组内必须按 pinned_at 排，不能顺手复用 created_at ——
+                # 否则置顶一条老会话时它会落到置顶组最下面，用户以为没生效。
+                # pinned_at 是 YYYY-MM-DDTHH:MM:SS 文本，字典序即时间序。
+                "s.pinned_at DESC, "
+                "s.created_at DESC, s.id DESC LIMIT ?",
                 (client_id, limit),
             ).fetchall()
-            return [{"id": r["id"], "title": r["title"], "start_time": r["created_at"], "end_time": r["closed_at"] or "", "turn_count": r["turn_count"]} for r in rows]
+            return [{"id": r["id"], "title": r["title"], "start_time": r["created_at"], "end_time": r["closed_at"] or "", "turn_count": r["turn_count"], "pinned_at": r["pinned_at"]} for r in rows]
 
     def set_session_title(self, session_id: str, title: str, client_id: str = "") -> bool:
         """改写会话标题。client_id 参与 WHERE，返回是否真的改到了行。"""
@@ -533,6 +608,24 @@ class QADatabase:
             cur = conn.execute(
                 "UPDATE sessions SET title = ? WHERE id = ? AND client_id = ?",
                 (title, session_id, client_id),
+            )
+            return cur.rowcount > 0
+
+    def set_session_pinned(self, session_id: str, pinned: bool, client_id: str = "") -> bool:
+        """置顶 / 取消置顶。
+
+        时间戳由本方法自己盖，接收的是布尔而不是时刻字符串：pinned_at 的排序
+        完全依赖 time.strftime 这个格式（字典序即时间序），让调用方自己拼一个
+        时刻，就等于把「格式必须与 list_sessions 的 ORDER BY 一致」变成跨文件的
+        口头约定 —— 那正是本功能里最容易静默坏掉的一环。
+
+        与 set_session_title 同形：client_id 参与 WHERE —— 归属校验由调用方
+        前置（session_id 可猜），这里是纵深防御的第二道。
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE sessions SET pinned_at = ? WHERE id = ? AND client_id = ?",
+                (time.strftime("%Y-%m-%dT%H:%M:%S") if pinned else "", session_id, client_id),
             )
             return cur.rowcount > 0
 
@@ -546,7 +639,7 @@ class QADatabase:
                 return None
             # 带 id 排序的原因同 list_sessions：并发下可能出现两条 turn_index = 0
             turns = conn.execute(
-                "SELECT question, answer, strategy, complexity, routing_reasoning, retrieved_docs, created_at "
+                "SELECT turn_index, question, answer, strategy, complexity, routing_reasoning, retrieved_docs, created_at "
                 "FROM qa_records WHERE session_id = ? AND client_id = ? ORDER BY turn_index, id",
                 (session_id, client_id),
             ).fetchall()
@@ -556,6 +649,12 @@ class QADatabase:
                 "start_time": ses["created_at"],
                 "end_time": ses["closed_at"] or "",
                 "turns": [{
+                    # turn_index 必须原样透出：分享功能让用户挑轮次，传的是这个值
+                    # 而不是数组下标。下标是隐式契约，任何一次前端过滤都会让它
+                    # 静默错位，后果是把 A 轮的答案公开挂在 B 轮的问题下面。
+                    # 注意它不保证连续（并发下会有两条 turn_index = 0），
+                    # 所以调用方只能用「值相等」来匹配，不能拿它当序号。
+                    "turn_index": t["turn_index"],
                     "question": t["question"],
                     "answer": t["answer"],
                     "strategy": t["strategy"] or "",
@@ -568,5 +667,73 @@ class QADatabase:
     def delete_session(self, session_id: str, client_id: str = ""):
         with self._connect() as conn:
             conn.execute("DELETE FROM qa_records WHERE session_id = ? AND client_id = ?", (session_id, client_id))
+            # 会话的公开分享链接随之作废。放在 DB 层而不是端点层：这是单会话删除
+            # 的唯一实现，而这个仓库里还有第二条按 client_id 批量删的路径
+            # （_init_schema 的旧患者清理），两条都必须级联，放这里能确保
+            # 「删了会话」这一个语义只有一处实现。
+            conn.execute("DELETE FROM shares WHERE session_id = ? AND client_id = ?", (session_id, client_id))
             conn.execute("DELETE FROM sessions WHERE id = ? AND client_id = ?", (session_id, client_id))
         logger.info(f"Session deleted from SQLite: {session_id} (client={client_id})")
+
+    # ── 会话分享 ──────────────────────────────────────────────────────
+
+    def create_share(self, session_id: str, client_id: str, title: str, turns: list[dict]) -> dict:
+        """创建分享，返回落库后的那一行（含 token）。
+
+        turns 必须是**已经按 SHARE_TURN_FIELDS 裁剪过的**内容快照 ——
+        调用方负责裁剪，本方法只负责存。
+        """
+        # 空 client_id 直接拒绝，这是纵深防御而不是多余检查：client_id 是撤销
+        # 归属校验与两条级联删除的**唯一**依据，一条空串的行既撤销不了、也不会被
+        # 任何级联清掉，等于一条永久公开的链接。别只靠端点写对。
+        if not client_id:
+            raise ValueError("create_share 需要非空 client_id")
+
+        token = secrets.token_urlsafe(SHARE_TOKEN_BYTES)
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO shares (token, session_id, client_id, title, turns, created_at, revoked_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, '')",
+                (token, session_id, client_id, title, json.dumps(turns, ensure_ascii=False), created_at),
+            )
+        logger.info(f"Share created: {session_id} ({len(turns)} turns, client={client_id})")
+        return {"token": token, "title": title, "created_at": created_at, "turn_count": len(turns)}
+
+    def get_share(self, token: str) -> Optional[dict]:
+        """按 token 取分享。**只认未撤销的**，返回 None 表示不存在或已失效。
+
+        公开端点，调用方无法也不该做归属校验 —— token 本身就是凭据。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT token, session_id, title, turns, created_at FROM shares "
+                "WHERE token = ? AND COALESCE(revoked_at, '') = ''",
+                (token,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            turns = json.loads(row["turns"])
+        except (ValueError, TypeError):
+            # 一条坏行不能让公开页变成 500，更不能把半截内容当有效数据吐出去
+            logger.exception(f"分享 {row['token']} 的 turns 不是合法 JSON，按失效处理")
+            return None
+        if not isinstance(turns, list):
+            logger.error(f"分享 {row['token']} 的 turns 不是数组，按失效处理")
+            return None
+        return {
+            "title": row["title"] or "",
+            "created_at": row["created_at"],
+            "turns": turns,
+        }
+
+    def revoke_share(self, token: str, client_id: str = "") -> bool:
+        """撤销分享。client_id 参与 WHERE，返回是否真的撤到了行。"""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE shares SET revoked_at = ? "
+                "WHERE token = ? AND client_id = ? AND COALESCE(revoked_at, '') = ''",
+                (time.strftime("%Y-%m-%dT%H:%M:%S"), token, client_id),
+            )
+            return cur.rowcount > 0

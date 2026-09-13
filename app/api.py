@@ -34,6 +34,8 @@ from qa_database import (
     MAX_PASSWORD_LEN,
     MIN_PASSWORD_LEN,
     QADatabase,
+    SHARE_MAX_TURNS,
+    SHARE_TURN_FIELDS,
     clean_title,
     generate_email_code,
 )
@@ -196,6 +198,16 @@ app.add_middleware(
 
 PUBLIC_PATHS = {"/api/health", "/api/auth"}
 
+# 公开的路径前缀。目前只有会话分享的读取接口：拿到链接的人不需要访问密码。
+# ⚠️ 前缀必须与 HTTP 方法**绑在一起**判断（见下方中间件），不能只按前缀放行 ——
+# 只按前缀的话对所有方法都生效，而撤销端点是 DELETE /api/shares/{token}
+# （多个 s），今天靠拼写差异侥幸躲过去了，但那是靠拼写而不是靠语义建立的边界。
+# 哪天有人把撤销端点改回 DELETE /api/share/{token}，中间件就会把一个未认证的
+# **状态变更**请求放进业务代码里。
+# 注意这条与 PROTECTED_PREFIXES 是并列的：/api/share/... 仍在 ("/api",) 覆盖
+# 范围内，所以它照样经过限流 —— 「公开 ≠ 无限额」，分享链接是一条零成本读通道。
+PUBLIC_GET_PREFIXES = ("/api/share/",)
+
 # 需要鉴权的路径前缀，其余一切（SPA 路由、/assets/*.js、favicon）都公开。
 #
 # 这条分界必须画在中间件里，不能靠"把静态路由注册在中间件之后"来实现：
@@ -223,7 +235,11 @@ async def auth_middleware(request: Request, call_next):
             content={"detail": "请求过于频繁，请稍后再试"}
         )
 
-    if path in PUBLIC_PATHS:
+    # 公开分享读取。必须在限流之后（见上），且方法必须一起判 —— 理由见
+    # PUBLIC_GET_PREFIXES 的注释。
+    if path in PUBLIC_PATHS or (
+        request.method in ("GET", "HEAD") and path.startswith(PUBLIC_GET_PREFIXES)
+    ):
         return await call_next(request)
 
     # 未配置访问密码时拒绝服务，而不是静默放行全部接口
@@ -863,6 +879,40 @@ def delete_session(session_id: str, request: FastAPIRequest):
     }
 
 
+@app.put("/api/sessions/{session_id}/pin")
+def pin_session(session_id: str, request: FastAPIRequest):
+    """置顶会话。**刻意不带请求体**（见下），所以 PUT 与 DELETE 是一对纯语义开关。"""
+    cid = _get_patient(request)
+    db = get_qa_db()
+
+    # 归属校验必须前置，与改名/删除同一惯例：session_id 是可猜的
+    # （sess_<unix秒>_<6位十六进制>），漏了就是任何登录用户可置顶任何人的会话。
+    if db.get_session_detail(session_id, client_id=cid) is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    # 为什么用无请求体的 PUT/DELETE 而不是 {"pinned": true}：
+    # 本文件给所有 Pydantic 字段都写了默认值（见 ShareCreate 附近的说明），
+    # 于是 pinned: bool = False 会让 {"pinned_": true} 这种拼写错误**返回 200
+    # 并且取消置顶** —— 一次静默的反向操作。意图写进 HTTP 方法里就没有可拼错的
+    # 字段。这也与已有的无体 PUT /api/sessions/{id}/activate 同一风格。
+    if not db.set_session_pinned(session_id, True, client_id=cid):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"session_id": session_id, "pinned": True}
+
+
+@app.delete("/api/sessions/{session_id}/pin")
+def unpin_session(session_id: str, request: FastAPIRequest):
+    cid = _get_patient(request)
+    db = get_qa_db()
+
+    if db.get_session_detail(session_id, client_id=cid) is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    if not db.set_session_pinned(session_id, False, client_id=cid):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"session_id": session_id, "pinned": False}
+
+
 @app.put("/api/sessions/{session_id}/activate")
 def activate_session(session_id: str, request: FastAPIRequest):
     """切换到指定历史会话，后续提问将延续该会话"""
@@ -903,6 +953,87 @@ def create_session(request: FastAPIRequest):
     db.create_session(new_sid, client_id=cid)
 
     return {"session_id": new_sid}
+
+
+# ── Share endpoints ───────────────────────────────────────────────────
+
+# 字段一律给默认值。required 字段触发的是 422，而 422 的 detail 是一个数组，
+# 前端把它当字符串渲染出来就是 [object Object]（见本文件其他模型同样的说明）。
+class ShareCreate(BaseModel):
+    turns: list[int] = []
+
+
+@app.post("/api/sessions/{session_id}/share")
+def create_share(session_id: str, body: ShareCreate, request: FastAPIRequest):
+    """把选中的若干轮问答固化成一条公开链接。"""
+    cid = _get_patient(request)
+    db = get_qa_db()
+
+    # 归属校验必须前置，与改名/删除同一惯例：session_id 是可猜的
+    # （sess_<unix秒>_<6位十六进制>），漏了就是任何登录用户可分享任何人的会话，
+    # 而且是**公开**分享。
+    detail = db.get_session_detail(session_id, client_id=cid)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    # 请求里传的是真实 turn_index，不是数组下标 —— 下标是隐式契约，任何一次
+    # 「过滤掉空答案」这类前端改动都会让它静默错位，后果是把 A 轮的答案公开挂在
+    # B 轮的问题下面。注意 turn_index 不保证连续（并发下会有两条 = 0）。
+    wanted = body.turns
+    if not wanted:
+        raise HTTPException(status_code=400, detail="请至少选择一轮对话")
+    if len(wanted) > SHARE_MAX_TURNS:
+        raise HTTPException(status_code=400, detail=f"一次最多分享 {SHARE_MAX_TURNS} 轮对话")
+
+    by_index = {t["turn_index"]: t for t in detail["turns"]}
+    picked: list[dict] = []
+    seen: set[int] = set()
+    for idx in wanted:
+        if idx in seen:
+            continue
+        turn = by_index.get(idx)
+        # 不存在的轮次直接拒绝整个请求，而不是跳过：静默少几轮会让用户以为
+        # 自己漏勾了，而链接已经发出去了。
+        if turn is None:
+            raise HTTPException(status_code=400, detail=f"第 {idx} 轮对话不存在")
+        seen.add(idx)
+        picked.append(turn)
+
+    # 按会话原本的顺序输出，而不是用户勾选的先后 —— 后者会让分享页上的问答
+    # 顺序与用户记忆中的对话顺序不一致。
+    picked.sort(key=lambda t: t["turn_index"])
+
+    # 白名单裁剪，理由见 qa_database.SHARE_TURN_FIELDS
+    snapshot = [{k: t.get(k, "") for k in SHARE_TURN_FIELDS} for t in picked]
+    data = db.create_share(session_id, cid, detail["title"], snapshot)
+    # path 由后端给出，前端不自己拼 —— 路由前缀属于服务端的事
+    return {**data, "path": f"/s/{data['token']}"}
+
+
+@app.get("/api/share/{token}")
+def get_share(token: str):
+    """公开读取。**无需任何鉴权** —— token 本身就是凭据。
+
+    失效（不存在 / 已撤销 / 行损坏）一律 404，不区分原因：区分了就等于给
+    「这个 token 曾经存在过」提供了一条探测通道。
+    """
+    data = get_qa_db().get_share(token)
+    if data is None:
+        raise HTTPException(status_code=404, detail="分享不存在或已失效")
+    return data
+
+
+@app.delete("/api/shares/{token}")
+def revoke_share(token: str, request: FastAPIRequest):
+    """撤销分享。注意路径是 /api/shares/（复数），与公开的 /api/share/ 不同 ——
+    中间件的公开前缀是方法绑定的，这个 DELETE 走不到那条豁免。"""
+    cid = _get_patient(request)
+    db = get_qa_db()
+
+    # client_id 参与 WHERE（见 revoke_share），所以别人的 token 撤不掉
+    if not db.revoke_share(token, client_id=cid):
+        raise HTTPException(status_code=404, detail="分享不存在或已撤销")
+    return {"status": "revoked"}
 
 
 # ── Stats endpoint ────────────────────────────────────────────────────
