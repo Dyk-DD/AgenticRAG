@@ -25,13 +25,17 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import mailer
 from main import ClinicalDecisionSystem
 from qa_database import (
+    EMAIL_CODE_PURPOSES,
+    EMAIL_CODE_TTL_SECONDS,
     MAX_EMAIL_LEN,
     MAX_PASSWORD_LEN,
     MIN_PASSWORD_LEN,
     QADatabase,
     clean_title,
+    generate_email_code,
 )
 from security import (
     ACCESS_SUBJECT,
@@ -75,25 +79,81 @@ RATE_LIMIT_MAX = _env_int("RATE_LIMIT_MAX", 60)
 
 
 class RateLimiter:
-    def __init__(self):
+    """进程内滑动窗口限流器。
+
+    窗口与上限由构造参数给：验证码发信要表达「每天 N 封」，那是全局 60 秒窗口
+    表达不了的。
+
+    ⚠️ 进程内且易失：容器重启即归零，多 worker 时每个 worker 各算一份
+    （Dockerfile 钉死 --workers 1，所以眼下就是全局的）。用于发信配额时要清楚
+    这一点 —— 重启丢的是**额度记账**，不是防猜测的硬约束，后者在 SQLite 里。
+    """
+
+    def __init__(self, window_seconds: int, max_events: int, max_keys: int = 10_000):
+        self._window = window_seconds
+        self._max = max_events
+        self._max_keys = max_keys
         self._windows: dict[str, collections.deque] = {}
 
     def check(self, key: str) -> bool:
         now = time.time()
         window = self._windows.get(key)
         if window is None:
+            # 回收：不加这一步，key 空间就由调用方决定 —— 旧版 key 只有客户端
+            # IP（缓慢泄漏），换成邮箱之后攻击者每请求换一个地址就能让
+            # _windows 无限增长，等于一个可控的内存放大面。
+            if len(self._windows) >= self._max_keys:
+                self._evict()
             self._windows[key] = collections.deque([now])
             return True
         # 滑动窗口：移除超出时间窗口的记录
-        while window and window[0] < now - RATE_LIMIT_WINDOW:
+        while window and window[0] < now - self._window:
             window.popleft()
-        if len(window) >= RATE_LIMIT_MAX:
+        if len(window) >= self._max:
             return False
         window.append(now)
         return True
 
+    def _evict(self) -> None:
+        """先丢已空的窗口，再按插入序丢最旧的，直到降到上限以下。
 
-_rate_limiter = RateLimiter()
+        dict 保序，所以 next(iter(...)) 就是最早插入的那个。被丢掉的 key 会
+        丢失它的计数（等于提前放行），这是刻意的取舍：在内存被打爆和个别 key
+        的额度被重置之间，选后者。
+        """
+        for k in [k for k, w in self._windows.items() if not w]:
+            del self._windows[k]
+        while len(self._windows) >= self._max_keys:
+            self._windows.pop(next(iter(self._windows)))
+
+
+_rate_limiter = RateLimiter(RATE_LIMIT_WINDOW, RATE_LIMIT_MAX)
+
+# ── 验证码的发信 / 校验配额 ──────────────────────────────────────────
+#
+# 每邮箱的配额**不能**放中间件里：中间件只看得到 request.url.path，拿不到邮箱
+# （要拿就得 await request.body() 再把流塞回去，既脆又会让全站每个请求都被迫
+# 缓冲）。中间件那层保持 IP 键、全局；邮箱键的配额放在端点体内。
+#
+# 发信上限必须压在邮件服务商自己的每日上限之下，否则用户看到的是看似代码 bug
+# 的神秘 502。个人 QQ 邮箱的每日发信上限常远低于 100。
+EMAIL_CODE_RESEND_SECONDS = _env_int("EMAIL_CODE_RESEND_SECONDS", 60)
+EMAIL_SEND_MAX_PER_EMAIL_HOUR = _env_int("EMAIL_SEND_MAX_PER_EMAIL_HOUR", 3)
+EMAIL_SEND_MAX_PER_EMAIL_DAY = _env_int("EMAIL_SEND_MAX_PER_EMAIL_DAY", 10)
+EMAIL_SEND_MAX_PER_IP_DAY = _env_int("EMAIL_SEND_MAX_PER_IP_DAY", 30)
+EMAIL_VERIFY_MAX_PER_IP_HOUR = _env_int("EMAIL_VERIFY_MAX_PER_IP_HOUR", 30)
+
+_email_cooldown = RateLimiter(EMAIL_CODE_RESEND_SECONDS, 1)
+_email_hourly = RateLimiter(3600, EMAIL_SEND_MAX_PER_EMAIL_HOUR)
+_email_daily = RateLimiter(86400, EMAIL_SEND_MAX_PER_EMAIL_DAY)
+_ip_send_daily = RateLimiter(86400, EMAIL_SEND_MAX_PER_IP_DAY)
+_ip_verify_hourly = RateLimiter(3600, EMAIL_VERIFY_MAX_PER_IP_HOUR)
+
+# 发信这一段（查配额 → 发信 → 落库）串行化，双击不会产生两封信加两次竞态插入。
+# 代价是发送被串行（每次最多 SMTP_TIMEOUT_SECONDS），在本站并发下无所谓。
+# 若将来并发上来了，替代方案是按邮箱加锁，但那需要自己的回收（同限流器的
+# 无界 key 问题）。
+_EMAIL_CODE_LOCK = threading.Lock()
 
 
 def _client_ip(request: Request) -> str:
@@ -249,40 +309,170 @@ def _get_patient(req: FastAPIRequest) -> str:
 # ── Account endpoints ─────────────────────────────────────────────────
 #
 # 账号叠在全局访问密码之后：中间件先验 Bearer 访问令牌，这里再验账号密码。
-# 保留全局门是有意的 —— 它是不发验证邮件的前提下唯一能挡住陌生人烧
-# DeepSeek 额度的一层。
+# 保留全局门是有意的 —— 它仍是一层挡住陌生人烧 DeepSeek 额度的屏障。
+#
+# 发信端点**同样留在全局门之后**，不进 PUBLIC_PATHS。一旦服务器能发信，多出来
+# 的第二个可被烧的资源是发信域名的声誉与服务商额度；让未认证方使本站域名向
+# 任意地址发信，是比烧额度更糟的垃圾邮件/黑名单向量。而且它买不到什么：
+# ChatGate 已经强制先过 LoginPage 再到 AccountGate，用户能走到发码表单时手上
+# 必然有 Bearer 令牌。
 #
 # 返回体沿用 patient_token 这个名字，令牌载荷也仍然是 issue_token(patient_id)，
 # 这样 _get_patient 与全部 client_id 数据隔离逻辑一行都不用改。
 #
-# 不发邮件：没有验证码、没有密码重置。忘记密码只能靠管理员跑
-# scripts/migrate_sessions_to_account.py 改挂到新账号，前端要把这点说清。
+# 验证码本身**不签发任何令牌**：那会绕不开 _get_patient 只拒绝 sub == "access"
+# 的问题（任何其它已签名的 sub 都会被当成 patient_id）。不签发就没有这个面。
 
-# 够用即可：不发信，所以只用来拦手误，不做 RFC 5322，也不查 MX
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# 不做 RFC 5322，也不查 MX —— 但它**不再**只是拦手误：这个地址会被塞进邮件头
+# 的 To:，而换行就是头部注入原语。所以必须是 fullmatch 而不是 match：re.match
+# 配 $ 锚会放过结尾的 \n（实测 "a@b.co\n" 能通过 match），今天只是因为
+# _normalize_email 恰好先 strip 了才没事 —— 那是调用顺序上的巧合，不是保证。
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+# 验证码校验失败的响应文案。'missing'（从没申请过 / 已被消费）与 'wrong'
+# 合并成同一句：二者都不该告诉调用方「这个码存在过」。
+_CODE_ERRORS = {
+    "missing": "验证码错误",
+    "wrong": "验证码错误",
+    "expired": "验证码已过期，请重新获取",
+    "too_many": "验证码错误次数过多，请重新获取",
+}
+
+class AccountEmailCode(BaseModel):
+    email: str
+    purpose: str = "register"
 
 class AccountRegister(BaseModel):
     email: str
     password: str
     name: str = ""
+    # 默认空串而不是必填：必填缺字段时 FastAPI 抛的是 422，而它的 detail 是
+    # 一个数组，前端的 `detail || HTTP xxx` 会渲染成 [object Object]。
+    # 给默认值再在端点里校验，用户看到的就是一句干净的 400。
+    code: str = ""
 
 class AccountLogin(BaseModel):
     email: str
     password: str
 
+class AccountPasswordReset(BaseModel):
+    email: str
+    code: str = ""
+    new_password: str = ""
+
 def _normalize_email(raw: str) -> str:
     return (raw or "").strip().lower()
 
-@app.post("/api/accounts/register", status_code=201)
-def register_account(body: AccountRegister):
-    email = _normalize_email(body.email)
-    if len(email) > MAX_EMAIL_LEN or not _EMAIL_RE.match(email):
+
+def _validate_email_or_400(email: str) -> None:
+    if len(email) > MAX_EMAIL_LEN or not _EMAIL_RE.fullmatch(email):
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
+
+
+def _validate_code_or_400(code: str) -> str:
+    """验证码必须是恰好 6 位 ASCII 数字。返回去空白后的码。"""
+    code = (code or "").strip()
+    # isascii 不能省：'１２３４５６'（全角）的 isdigit() 是 True，而它永远
+    # 不可能是我们发出去的码，放进去只会白烧一个 attempts 名额。
+    if len(code) != 6 or not code.isascii() or not code.isdigit():
+        raise HTTPException(status_code=400, detail="验证码格式不正确")
+    return code
+
+
+@app.post("/api/accounts/email-code")
+def send_email_code(body: AccountEmailCode, request: Request):
+    """发一封验证码邮件。成功返回 200，客户端永远拿不到验证码本身。"""
+    email = _normalize_email(body.email)
+    purpose = (body.purpose or "register").strip().lower()
+    _validate_email_or_400(email)
+    if purpose not in EMAIL_CODE_PURPOSES:
+        raise HTTPException(status_code=400, detail="验证方式不正确")
+
+    db = get_qa_db()
+    exists = db.account_exists(email)
+    if purpose == "register" and exists:
+        # 与 POST /api/accounts/register 的 409 同一个文案。这里泄露「邮箱是否
+        # 已注册」是**刻意**的：注册接口本来就泄露同样的事实，堵这里买不到任何
+        # 机密性，却要为每个已注册地址白花一次真实发信。
+        raise HTTPException(status_code=409, detail="该邮箱已注册")
+    if purpose == "reset" and not exists:
+        # 不告诉调用方这个邮箱存不存在，也不白花一次发信。
+        #
+        # ⚠️ 残留的旁路：这条分支立即返回，而真发信要花几百毫秒到几秒，所以
+        # 响应时间仍然能区分「已注册」。它不构成新的泄露（register 的 409 已经
+        # 明说了），要靠 dummy sleep 去抹平则是拿一个每秒一次的延迟换一个已知
+        # 的秘密，不划算。如实记在这里，不要假装堵上了。
+        logger.info("验证码邮件跳过：邮箱未注册 purpose=%s", purpose)
+        return _code_sent_payload()
+
+    # 三层分开是为了给出不同文案：冷却是等一等就有，每日上限是今天没戏了。
+    if not _email_cooldown.check(email):
+        raise HTTPException(
+            status_code=429,
+            detail="发送过于频繁，请稍后再试",
+            headers={"Retry-After": str(EMAIL_CODE_RESEND_SECONDS)},
+        )
+    if not (_email_hourly.check(email) and _email_daily.check(email)
+            and _ip_send_daily.check(_client_ip(request))):
+        raise HTTPException(status_code=429, detail="今日验证码发送次数已达上限")
+
+    if not mailer.is_configured():
+        raise HTTPException(status_code=503, detail="未配置邮件服务，无法发送验证码")
+
+    with _EMAIL_CODE_LOCK:
+        code = generate_email_code()
+        try:
+            mailer.send_code_email(email, code, purpose, EMAIL_CODE_TTL_SECONDS)
+        except mailer.MailNotConfigured:
+            raise HTTPException(status_code=503, detail="未配置邮件服务，无法发送验证码")
+        except mailer.MailSendError as exc:
+            # 502 而不是 503：503 在中间件里已经表示「这个部署缺 ACCESS_PASSWORD」，
+            # 两者必须在日志和监控里可区分。只记收件人与异常类型 —— 验证码本身
+            # 是一次性凭据，绝不能进日志（这里也绝不回显给客户端）。
+            logger.error(
+                "验证码邮件发送失败 recipient=%s purpose=%s type=%s",
+                email, purpose, type(exc).__name__, exc_info=True,
+            )
+            raise HTTPException(status_code=502, detail="验证码发送失败，请稍后再试")
+        # 只有发送成功才落库：发失败却先落库的话，用户被冷却卡住、手里却没码。
+        db.store_email_code(email, purpose, code, EMAIL_CODE_TTL_SECONDS)
+
+    logger.info("验证码已发送 recipient=%s purpose=%s", email, purpose)
+    return _code_sent_payload()
+
+
+def _code_sent_payload() -> dict:
+    """发信成功的响应。resend_after 由服务端下发，前端的倒计时就不会与服务端的
+    冷却各说各话。"""
+    return {
+        "sent": True,
+        "expires_in": EMAIL_CODE_TTL_SECONDS,
+        "resend_after": EMAIL_CODE_RESEND_SECONDS,
+    }
+
+
+@app.post("/api/accounts/register", status_code=201)
+def register_account(body: AccountRegister, request: Request):
+    email = _normalize_email(body.email)
+    _validate_email_or_400(email)
     if not (MIN_PASSWORD_LEN <= len(body.password) <= MAX_PASSWORD_LEN):
         raise HTTPException(
             status_code=400,
             detail=f"密码长度需在 {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} 个字符之间",
         )
+    code = _validate_code_or_400(body.code)
+    if not _ip_verify_hourly.check(f"{_client_ip(request)}:register"):
+        raise HTTPException(status_code=429, detail="尝试过于频繁，请稍后再试")
+
+    # 先验码并消费，再建账号。反过来的话会开一个重放窗口：部分失败会留下
+    # 「有效码 + 已建账号」。代价是随后的 INSERT 若失败（磁盘错、或输给
+    # idx_patients_email 的竞争），码已烧掉，用户得重新获取 —— 可接受。
+    result = get_qa_db().consume_email_code(email, "register", code)
+    if result != "ok":
+        # 403 而不是 401：客户端的 ensureAccountOk 只在 401 时清本地身份并整页
+        # 重载，用 401 会把用户填好的表单连同全局访问令牌一起丢掉。
+        raise HTTPException(status_code=403, detail=_CODE_ERRORS.get(result, "验证码错误"))
+
     name = (body.name or "").strip() or email.split("@", 1)[0]
     try:
         account = get_qa_db().register_account(email, name[:40], body.password)
@@ -291,6 +481,41 @@ def register_account(body: AccountRegister):
         raise HTTPException(status_code=409, detail="该邮箱已注册")
     account["patient_token"] = issue_token(account["patient_id"], PATIENT_TTL)
     return account
+
+
+@app.post("/api/accounts/password-reset")
+def password_reset(body: AccountPasswordReset, request: Request):
+    """验证码通过后重设密码。
+
+    ⚠️ **不能吊销已经签发的 patient_token**：令牌是无状态 HMAC、30 天有效，
+    而 security.py 与本模块都没有 denylist。所以改密码挡不住一个已经偷到令牌
+    的人。真正的修法是给 patients 加 token_epoch 并在 _get_patient 里校验 ——
+    那是独立的一次改动。
+    """
+    email = _normalize_email(body.email)
+    _validate_email_or_400(email)
+    if not (MIN_PASSWORD_LEN <= len(body.new_password) <= MAX_PASSWORD_LEN):
+        raise HTTPException(
+            status_code=400,
+            detail=f"密码长度需在 {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} 个字符之间",
+        )
+    code = _validate_code_or_400(body.code)
+    # 每 IP 的校验配额，与每码的 attempts 正交：防的是 attempts 计数器本身
+    # 失效（实现 bug）时无人兜底。它计每一次请求，不论是否存在活码。
+    if not _ip_verify_hourly.check(f"{_client_ip(request)}:reset"):
+        raise HTTPException(status_code=429, detail="尝试过于频繁，请稍后再试")
+
+    result = get_qa_db().consume_email_code(email, "reset", code)
+    if result != "ok":
+        raise HTTPException(status_code=403, detail=_CODE_ERRORS.get(result, "验证码错误"))
+    if not get_qa_db().set_account_password(email, body.new_password):
+        # 码有效但账号不见了 —— 只可能是发码之后被删掉的（比如管理员清了测试
+        # 数据）。如实说，别假报成功。
+        raise HTTPException(status_code=404, detail="该邮箱未注册")
+    logger.info("密码已重置 recipient=%s", email)
+    # 刻意不签发令牌：让所有签发令牌的端点维持同一种响应形状，前端本来就有
+    # 模式切换，多一次点击不值得多一条写 localStorage 的代码路径。
+    return {"reset": True}
 
 @app.post("/api/accounts/login")
 def login_account(body: AccountLogin):

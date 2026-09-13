@@ -408,7 +408,7 @@ services:
 
 ```
 Agentic-RAG/
-├── .env                  # API key、访问密码、隧道 token
+├── .env                  # API key、访问密码、隧道 token、SMTP 授权码
 ├── .env.example          # 环境变量模板
 ├── requirements.txt      # Python 依赖
 ├── Dockerfile            # 后端 API 镜像（同时托管前端静态资源）
@@ -420,6 +420,7 @@ Agentic-RAG/
 │   ├── api.py            # FastAPI：REST + SSE，并托管前端页面
 │   ├── security.py       # HMAC 签名令牌（访问令牌 + 患者身份令牌）
 │   ├── qa_database.py    # SQLite 会话与问答持久化
+│   ├── mailer.py         # 验证码邮件发送（标准库 smtplib，无新依赖）
 │   ├── web_app.py        # Streamlit Web UI
 │   ├── config.py         # 全局配置 (GraphRAGConfig)
 │   ├── clean_milvus.py   # 清理 Milvus 集合
