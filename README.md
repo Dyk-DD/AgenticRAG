@@ -88,6 +88,14 @@ Agentic-RAG 是面向临床场景的**图谱增强检索生成（GraphRAG）**�
 
 ## 快速开始
 
+> ⚠️ **本仓库只开源代码，不含数据与模型。**
+> `data/`（约 1.1 GB：6 科室约 8.6 万条问答 CSV、疾病词典、医学流程图）与
+> `models/`（约 5.1 GB：bge-base-zh-v1.5、bge-m3）都不纳入版本控制，
+> 所以**克隆下来并不能直接得到一个能问答的知识库** —— 需要自备同构的 CSV 数据，
+> 再按下面的流程建立索引。
+> 嵌入模型可以用 `scripts/download_model.py` 拉取到 `models/`。
+> 数据缺失时，界面、接口、账号体系都能正常跑通，只是检索不到任何内容。
+
 ### 环境要求
 
 - Python 3.11+
@@ -122,9 +130,6 @@ docker compose build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/wh
 ```bash
 docker compose build --build-arg PIP_INDEX_URL=https://pypi.org/simple
 ```
-
-用了 GPU 就要在 `docker-compose.yml` 的 `api` 服务里保留 `deploy.resources`
-那段；没有 N 卡则删掉它（否则容器起不来）。
 
 ### 1. 克隆与配置
 
@@ -253,11 +258,16 @@ cd frontend && npm run dev
 前端与后端跑在同一组容器里，由一条 Cloudflare Tunnel 暴露，共用一个 HTTPS 域名。
 同源意味着没有跨域、没有 mixed content，访客打开一个链接就能用，无需任何配置。
 
+**同一条隧道可以带多个应用**：在控制台加若干条 Public Hostname，各指向 compose
+网络内不同的服务名即可。下面按单应用说明。
+
 ```
 浏览器 ──HTTPS──▶ Cloudflare 边缘 ──隧道──▶ cloudflared 容器
-                                                │ http://api:8000
-                                                ▼
-                                        api 容器（FastAPI + SPA 静态资源）
+                                                    │
+                                                    ▼
+                                          www：http://api:8000
+                                                    │
+                                        api 容器（FastAPI + SPA）
                                           ├── bolt://neo4j:7687
                                           └── milvus:19530
 ```
@@ -266,6 +276,11 @@ cd frontend && npm run dev
 
 > **代价要说清楚**：后端跑在个人电脑上，机器关机或休眠时站点就打不开。
 > 这是「本地后端 + 隧道」这种形态的固有代价，不是配置问题。
+
+> **回源到多个 compose 项目时，先解决服务名重名**：Docker 的内嵌 DNS 会在容器
+> 接入的**所有**网络里查服务名，两张网上各有一个同名服务时解析结果不确定 ——
+> 表现是回源时通时不通、偶尔还回到另一个应用的后端。真要多应用，就把回源容器
+> 单独接到一张只含它的网络上，别让它和重名服务同处一张网。
 
 ### 1. 域名与隧道
 
@@ -404,47 +419,18 @@ services:
 `package.json` / `tsconfig` / `eslint.config.js`，开根目录会让 TS 服务按后端那套
 配置解析，飘一堆假报错。
 
-#### 5.3 跑评测
-
-`scripts/local_test.sh` 把「拷脚本进容器 → 跑评测 → 清测试数据」封成一条命令：
-
-```bash
-./scripts/local_test.sh                 # 导入检查 + 检索/路由评测(20条) + 清数据
-./scripts/local_test.sh --full          # 加 generation/e2e + LLM Judge（慢、花钱）
-./scripts/local_test.sh --smoke         # 只导入检查，不花 LLM 钱
-./scripts/local_test.sh --sample 50     # 换采样条数
-./scripts/local_test.sh --no-clean      # 跑完不清数据
-./scripts/local_test.sh --clean-only    # 跳过检查与评测，只清数据
-./scripts/local_test.sh --dry-run       # 只统计待删记录数，不做任何删除
-```
-
-输出实时流式，同时留档到 `scripts/.local_test_last.log`。评测会把患者/会话/问答
-写进 SQLite，默认跑完自动清掉（只动 `qa_history.db`，不碰 Milvus 与 Neo4j）。
-
-脚本内部处理了两件必须做对的事：`scripts/` 在 `.dockerignore` 里（镜像中没有）
-所以要先 `docker cp` 进容器，且落点必须是 `/app/scripts/` —— `evaluate.py` 用
-`__file__` 反推项目根，放 `/tmp` 会 import 不到 `app.*`；Git Bash 下还要
-`MSYS_NO_PATHCONV=1`，否则容器路径会被改写成 Windows 路径。
-
-> **测试集必须与知识库同源**，否则检索指标恒为 0：ground truth 的 node_id 由
-> `md5(科室_标题_问_答)` 算出，拿别的科室的 CSV 当测试集一条都匹配不上。
-> 用 `scripts/strategy_comparison/sample_testset.py` 采样、
-> `label_routing_ground_truth.py` 标注路由 ground truth 生成。
-> 直接跑公网 `https://www.yankandou.com` 做人工验收也可以，但只有这条路能出
-> 可量化的指标。
-
 ## 项目结构
 
 ```
 Agentic-RAG/
-├── .env                  # API key、访问密码、隧道 token、SMTP 授权码
+├── .env                  # API key、访问密码、隧道 token、SMTP 授权码（gitignored）
 ├── .env.example          # 环境变量模板
 ├── requirements.txt      # Python 依赖
 ├── Dockerfile            # 后端 API 镜像（同时托管前端静态资源）
 ├── .dockerignore
 ├── docker-compose.yml    # 全部服务编排
 │
-├── app/                  # 主应用
+├── app/                  # 主应用（后端）
 │   ├── main.py           # 系统入口 & 协调器
 │   ├── api.py            # FastAPI：REST + SSE，并托管前端页面
 │   ├── security.py       # HMAC 签名令牌（访问令牌 + 患者身份令牌）
@@ -463,22 +449,26 @@ Agentic-RAG/
 │       ├── generation_integration.py      # DeepSeek 答案生成
 │       └── conversation_memory.py         # 对话记忆模块 (三层混合)
 │
-├── models/               # 本地嵌入模型
+├── frontend/             # React 前端源码（构建产物 frontend/dist 挂载给后端托管）
+│   ├── src/
+│   ├── package.json
+│   └── vite.config.ts
+│
+├── models/               # 本地嵌入模型（gitignored，用下载脚本拉取）
 │   ├── bge-base-zh-v1.5/
 │   └── bge-m3/
 │
-├── data/
+├── data/                 # 知识库数据（gitignored，需自备，见「快速开始」）
 │   ├── raw/              # 原始 CSV 数据 (6 科室 ~86k QA)
 │   ├── processed/         # 处理后数据
 │   ├── disease_dict.txt   # 疾病词典 (~1000 条目)
-│   ├── test_100.csv        # 测试数据
+│   ├── test_100.csv       # 测试数据
 │   ├── images/            # 医学流程图
-│   └── neo4j/             # Neo4j 持久化 (gitignored)
+│   └── neo4j/             # Neo4j 持久化
 │
 ├── scripts/              # 工具脚本
-│   ├── download_model.py
-│   ├── convert_csv_encoding.py
-│   └── clean_neo4j.py
+│   ├── download_model.py     # 拉取嵌入模型到 models/
+│   └── download_tcmner.py    # 拉取 TCMNER 模型
 │
 └── volumes/              # Docker 运行时数据 (gitignored)
 ```
@@ -541,4 +531,4 @@ CSV 加载 (data/processed/)
 
 ## License
 
-MIT
+[MIT](LICENSE)

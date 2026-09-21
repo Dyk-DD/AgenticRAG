@@ -1,0 +1,1423 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* 全局变量。这里只放**跨界面共用**的值：登录页/账号页、公开主页、对话界面
+   都在用 --primary；--text / --border / --radius 等由登录卡片消费。
+   对话界面自己那套浅色调色板不在这里，作用域在 .app-layout 上（见下方），
+   原先的 --sidebar-bg / --sidebar-text / --sidebar-active 随深色侧边栏一起删除。 */
+:root {
+  --primary: #007BFF;
+  --primary-light: #e6f2ff;
+  --bg: #f7f8fa;
+  --card-bg: #fff;
+  --border: #e2e8f0;
+  --text: #1e293b;
+  --text-secondary: #64748b;
+  --danger: #ef4444;
+  --radius: 8px;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#root {
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+  text-align: left;
+  min-height: 100vh;
+}
+
+/* Layout */
+
+/* ── 对话界面调色板（浅色，对齐 DeepSeek 网页端）─────────────────────
+   与 .home-page 同一先例：整套变量作用域在**消费它的根元素**上，一条声明都不会
+   漏进登录页 / 账号页 / 公开主页。
+
+   两个作用域根：
+     - .app-layout    对话界面（侧栏 + 主区）
+     - .share-page    公开分享页（/s/:token）
+   分享页与 .app-layout 不在同一棵 DOM 上（它是独立路由，不经过 ChatGate），
+   所以必须**单独挂一份**，不能指望从 .app-layout 继承。
+
+   为什么是这些根而不是 :root —— ChatGate 在未登录时渲染 <LoginPage/> 或
+   <AccountGate/> 来代替 <Outlet/>，ChatLayout 根本不挂载，所以 .app-layout
+   天然把登录页与账号页隔离在外；HomePage 与 SharePage 又在别的路由上。
+
+   全局 --primary 刻意保持不动：.home-page 的 --home-accent 依赖它，改 :root
+   会顺带漂移公开主页与登录卡片。
+
+   ⚠️ 这条规则里**只放变量声明**。布局属性另立一条（见下），否则新增一个作用域根
+   就会连带继承 display:flex / height:100dvh —— 分享页要的是自己的滚动容器和
+   内容列，套上之后得在上面写一堆覆盖把继承来的东西推回去。 */
+.app-layout,
+.share-page {
+  /* 主区与文字 */
+  --chat-bg: #ffffff;
+  --chat-text: #1a1a1a;
+  --chat-text-secondary: #616a76;
+  --chat-rule: #e8eaed;
+
+  /* 侧边栏 */
+  --chat-sidebar-bg: #f9fafb;
+  --chat-sidebar-hover: #eef0f3;
+  --chat-sidebar-active: #e4e7ec;
+  --chat-sidebar-rule: #e3e6ea;
+
+  /* 表面（推理面板底、hover 填充） */
+  --chat-surface: #f5f6f7;
+
+  /* 强调色拆成两个不是笔误：DeepSeek 品牌蓝 #4d6bfe 对白字只有 4.33:1，
+     载不了小字，但作填充/图标/边框（非文本，门槛 3:1）合格且更贴近原版；
+     凡是要承载文字的地方一律用 -strong (#3b5bdb，双向 5.67:1)。 */
+  --chat-accent: #4d6bfe;
+  --chat-accent-strong: #3b5bdb;
+  --chat-accent-soft: #eef2ff;
+  --chat-bubble-user: #eef2ff;
+
+  /* 不用全局 --danger (#ef4444)：它在白底上只有 3.76:1，不达 AA，
+     浅色界面里不能拿来当文字色。 */
+  --chat-danger: #b91c1c;
+  --chat-danger-soft: #fef2f2;
+
+  --chat-column: 800px;
+  --chat-radius: 12px;
+}
+
+.app-layout {
+  display: flex;
+  /* 100dvh 写在后面：移动端浏览器工具栏收起/展开时 100vh 会把输入框顶出
+     视口，dvh 跟随可视高度。不支持的浏览器回落上面那条 100vh。 */
+  height: 100vh;
+  height: 100dvh;
+  background: var(--chat-bg);
+}
+
+.sidebar {
+  width: 280px;
+  background: var(--chat-sidebar-bg);
+  color: var(--chat-text);
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  flex-shrink: 0;
+  /* 浅色下侧栏与主区都是近白，靠这条发丝线定边界（深色时不需要） */
+  border-right: 1px solid var(--chat-sidebar-rule);
+  transition: width 0.2s ease, padding 0.2s ease;
+
+  /* ⚠️ 这条 position: relative 是「⋯ 会话菜单」不被裁掉的**唯一**依据，
+     删掉它菜单就会在列表滚动时被切成两半。机制：
+     滚动容器（.session-list，overflow-y:auto）的裁剪只作用于**包含块落在它
+     内部**的后代。.session-list 和 .session-item 都不是 positioned，所以包含块
+     由这里提供 —— .sidebar 是滚动容器的祖先，菜单因此不被裁。
+
+     ⚠️ 反过来说：**绝不能给 .session-item 加 position: relative**。
+     「给行加个定位上下文方便放绝对定位的按钮」是很自然的想法，但那会把包含块
+     重新放回 .session-list 内部，菜单当场被裁回去。要放菜单请改这里的锚点，
+     不要动行本身。 */
+  position: relative;
+}
+
+/* 宽屏折叠：把侧栏收成 0 宽。overflow: hidden 是必需的 —— 少了它，0 宽容器里
+   的子元素会照常溢出到主区上面。窄屏的抽屉形态在文件后段的 @media 里覆盖本块。 */
+.app-layout.sidebar-collapsed .sidebar {
+  width: 0;
+  padding-inline: 0;
+  border-right: none;
+  overflow: hidden;
+}
+
+/* 侧栏头部的图标按钮：品牌行里的「← 返回主页」与「« 收起」共用。
+   两者都是 <a> 或 <button>，所以 display 要显式写成 inline-flex —— <a> 默认
+   是 inline，撑不出 28px 的方框。 */
+.sidebar-icon-btn {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--chat-text-secondary);
+  font-size: 1rem;
+  font-family: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+.sidebar-icon-btn:hover {
+  background: var(--chat-sidebar-hover);
+  color: var(--chat-text);
+}
+
+/* 主区左上角的浮动按钮组（☰ 开合 / ＋ 新建 / ← 返回主页）。
+   宽屏折叠态与窄屏抽屉态共用它。
+   两个状态都写进 .app-layout.sidebar-collapsed 这一个类（见 ChatLayout.tsx 里
+   collapsed 的合成），所以这里只需按类切换，不必知道是宽是窄 —— 也正因如此
+   不能用 JS 条件渲染：按 collapsed 判的话，窄屏下抽屉一开按钮组就消失，
+   而它正是唯一的开合入口。
+   组里的按钮自己在侧栏里都有对应物（« / + 新会话 / ←），这里只是侧栏够不着时
+   的替身。 */
+.sidebar-toggle-group {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 20;
+  display: none;
+  gap: 8px;
+}
+.app-layout.sidebar-collapsed .sidebar-toggle-group { display: flex; }
+
+.sidebar-toggle {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--chat-bg);
+  border: 1px solid var(--chat-rule);
+  border-radius: 8px;
+  color: var(--chat-text);
+  font-size: 1rem;
+  font-family: inherit;
+  /* ← 是这个组里唯一的 <a>，不写这条会带上浏览器默认下划线 */
+  text-decoration: none;
+  cursor: pointer;
+}
+.sidebar-toggle:hover { background: var(--chat-surface); }
+
+/* 窄屏抽屉的遮罩。基础态 display:none（宽屏永不出现），断点里改为 block，
+   折叠（= 抽屉关闭）时再藏起来。 */
+.sidebar-scrim { display: none; }
+
+.sidebar-header {
+  margin-bottom: 16px;
+}
+
+.sidebar-header h2 {
+  font-size: 1.1rem;
+  color: var(--chat-text);
+  margin-bottom: 10px;
+}
+
+/* 品牌行：返回主页 / 字标 / 收起，三者同一行。margin-bottom 从 h2 移到行上，
+   否则按钮会被 h2 的下外边距顶下来、与字标错位。
+   不用 space-between：字标吃到 flex:1 之后会把「收起」顶到最右，两个图标按钮
+   各自贴边，中间的字标居中，这才是想要的读法（而 space-between 在字标变长时
+   会把它挤到和「收起」贴在一起）。 */
+.sidebar-header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+/* 侧栏最窄时字标装不下，截断而不是把两个图标按钮挤出去 */
+.sidebar-header-row h2 {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 幽灵按钮：浅色侧栏里实心蓝太抢眼，DeepSeek 的「新对话」也是描边样式。
+   font-family: inherit 是必需的 —— <button> 默认不继承字体，漏掉就会在
+   一整片系统字体里混进一个浏览器默认字体的控件。 */
+.btn-new-session {
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  color: var(--chat-text);
+  border: 1px solid var(--chat-rule);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-family: inherit;
+}
+.btn-new-session:hover { background: var(--chat-sidebar-hover); }
+
+/* 这里原有 .sidebar-nav / .nav-link（「返回主页」「对话」「历史记录」三个页签）。
+   随历史页一起删除：侧栏下方就是完整的会话列表，「对话」与「历史记录」指向的
+   是同一份数据，留两个入口只会让人以为它们不同；返回主页移到了品牌行左侧。 */
+
+.session-list { flex: 1; overflow-y: auto; }
+.session-list h3 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 8px;
+  color: var(--chat-text-secondary);
+}
+
+.session-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  margin-bottom: 2px;
+  cursor: pointer;
+}
+.session-item:hover { background: var(--chat-sidebar-hover); }
+/* 选中态去掉原来的 3px 左蓝条：浅色下它和圆角打架，DeepSeek 用的是整块底色。
+   文字必须用 --chat-text —— --chat-text-secondary 在 --chat-sidebar-active
+   (#e4e7ec) 上只有 4.42:1，差一点不到 AA。 */
+.session-item.active {
+  background: var(--chat-sidebar-active);
+  color: var(--chat-text);
+  font-weight: 500;
+}
+
+/* min-width:0 是省略号生效的前提：flex 项默认 min-width:auto，不缩到内容以下 */
+.session-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.session-turns { font-size: 0.7rem; color: var(--chat-text-secondary); }
+
+/* 标题最长 40 字而侧栏很窄，必溢出 —— 省略号 + 全文放 title 属性 */
+.session-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.85rem;
+}
+/* 置顶标记。inline 的 span 直接跟在标题文字前面，所以它也会跟着一起被省略号
+   截断 —— 但置顶的会话本来就在列表最前面，这里只是「哪条被置顶了」的补充说明，
+   排序本身已经说清了。 */
+.session-pin-mark { margin-right: 3px; font-size: 0.7rem; }
+
+/* 不能复用 .login-input —— 它带 letter-spacing:4px 和居中，是给访问码用的 */
+.title-input {
+  width: 100%;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--chat-accent);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--chat-text);
+  font-family: inherit;
+  font-size: 0.85rem;
+  outline: none;
+}
+
+/* ── 会话行的「⋯」菜单 ──────────────────────────────────────────────
+   定位模型（改动前务必读完，这里有两个反直觉的地方）：
+
+   ⚠️ 1. 菜单用 position: absolute，包含块是 **.sidebar**（它带 position:
+   relative），不是 .session-item。原因：滚动容器（.session-list）的裁剪只作用于
+   **包含块落在它内部**的后代。包含块一旦是 .session-item 或 .session-list，
+   菜单就会被裁成两半。所以 ——
+   ⚠️ 2. **绝不能给 .session-item 或 .session-menu-anchor 加 position:
+   relative**。「给行加个定位上下文好放按钮」是很自然的想法，但那会把包含块拽回
+   滚动容器内部，菜单当场被裁。要挪锚点请改 .sidebar 上的那条。
+
+   代价：top 是相对侧栏的，得由 SessionItem 量一次。那不是偷懒，是把包含块主动
+   移出滚动容器之后必然要做的换算。 */
+
+/* 必须是 static（默认），见上面第 2 条 */
+.session-menu-anchor { display: flex; flex: none; }
+
+.btn-session-menu {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--chat-text-secondary);
+  font-size: 0.9rem;
+  line-height: 1;
+  font-family: inherit;
+  cursor: pointer;
+}
+.btn-session-menu:hover { background: var(--chat-sidebar-active); color: var(--chat-text); }
+
+.session-menu {
+  position: absolute;
+  /* 与 .session-list 之间留一点缝，免得看着像长在行上 */
+  right: 16px;
+  /* z-index 只用来压过同层级的会话行；它和 .settings-popover 在同一个层叠
+     上下文（都相对 .sidebar 定位），两者不会同时打开。 */
+  z-index: 12;
+  min-width: 132px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid var(--chat-rule);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+}
+/* 行落在侧栏下半区时向上弹（top 由 SessionItem 量成行的上沿）。
+   用 translateY(-100%) 而不是减去一个写死的高度：菜单高度随项数变，写死就会错。
+   注意这条 transform 只影响菜单自己，它内部没有定位后代。 */
+.session-menu-up { transform: translateY(-100%); }
+
+.session-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--chat-text);
+  font-size: 0.85rem;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.session-menu-item:hover { background: var(--chat-sidebar-hover); }
+.session-menu-item:disabled { color: var(--chat-text-secondary); cursor: not-allowed; }
+.session-menu-item:disabled:hover { background: transparent; }
+/* 删除是唯一不可逆的一项，用红色单独标出，与设置浮层里的「退出登录」同一惯例 */
+.session-menu-item.danger { color: var(--chat-danger); }
+.session-menu-item.danger:hover { background: var(--chat-danger-soft); }
+
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* .sidebar-toggle 绝对定位的锚点 */
+  position: relative;
+}
+
+/* Chat Page */
+
+.chat-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* 内容列居中用 padding-inline 而不是给这里加 max-width：加 max-width 会把滚动条
+   挤到内容列内侧，而 DeepSeek 的滚动条贴在视口边缘。max() 保证窄屏仍有 24px 边距。 */
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding-block: 24px;
+  padding-inline: max(24px, calc((100% - var(--chat-column)) / 2));
+}
+
+/* 空会话态：问候语 + 输入框 + 示例按钮作为一组垂直居中。
+   .chat-messages 在这里必须退出 flex:1 —— 否则它会吃掉全部剩余高度、把输入框
+   推到最底部，那就成了「分居两端」而不是居中。 */
+.chat-page-empty {
+  /* safe 不能省：视口一矮（横屏手机、软键盘弹起），居中的内容会两头溢出，
+     而居中把内容推到滚动原点之上后，顶部那一截是滚不到的。safe 会在内容
+     装不下时退回 start 对齐。不认识 safe 的浏览器会整条丢弃 → 退回默认的
+     start，同样不出这种问题。 */
+  justify-content: safe center;
+  overflow-y: auto;
+}
+.chat-page-empty .chat-messages {
+  flex: 0 0 auto;
+  /* 与上面同一个理由：高度不够时要能滚出去，而不是被裁掉 */
+  overflow: visible;
+}
+
+.chat-welcome {
+  text-align: center;
+  margin-bottom: 28px;
+}
+.chat-welcome-title {
+  font-size: 1.5rem;
+  font-weight: 500;
+  color: var(--chat-text);
+  margin-bottom: 10px;
+}
+.chat-welcome-sub {
+  color: var(--chat-text-secondary);
+  font-size: 0.95rem;
+}
+
+/* 示例问题。空态时排在输入框下方。改中性描边样式 —— 原来那套「浅蓝底 + 蓝边框 +
+   药丸形」在这套克制配色里太花。 */
+.example-questions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 16px;
+  padding-inline: max(24px, calc((100% - var(--chat-column)) / 2));
+}
+.example-questions button {
+  background: transparent;
+  color: var(--chat-text-secondary);
+  border: 1px solid var(--chat-rule);
+  border-radius: 999px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-family: inherit;
+}
+.example-questions button:hover {
+  background: var(--chat-surface);
+  color: var(--chat-text);
+  border-color: var(--chat-text-secondary);
+}
+
+/* Message */
+
+.message {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.message-user { margin-left: auto; }
+.message-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  flex-shrink: 0;
+  background: var(--chat-surface);
+}
+
+/* 助手消息去气泡：DeepSeek 的回复是直接落在页面上的正文，没有卡片。有边框的气泡
+   会把一大段医学解释框成一坨，阅读时反而不如裸文本清爽。 */
+.message-assistant .message-body {
+  background: none;
+  border: none;
+  padding: 0;
+  min-width: 0;
+  max-width: 100%;
+}
+/* 用户消息保留气泡并右对齐，但换成浅蓝底、去掉边框、收窄到 80% */
+.message-user .message-body {
+  background: var(--chat-bubble-user);
+  border: none;
+  padding: 10px 14px;
+  border-radius: 14px;
+  max-width: 80%;
+}
+
+.message-text {
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cursor-blink {
+  animation: blink 0.8s infinite;
+}
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* Reasoning —— 「推理过程」面板，取代了原先的 .routing-card。
+   默认折叠成一行灰色小字，点开才是完整推理依据与三项指标。折叠行不用图标：
+   DeepSeek 的「已深度思考」也是一行纯文字，emoji 会破坏这个克制感。 */
+.reasoning { margin-bottom: 10px; }
+
+.reasoning-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--chat-surface);
+  border: none;
+  border-radius: 10px;
+  color: var(--chat-text-secondary);
+  font-size: 0.8rem;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.reasoning-toggle:hover { background: var(--chat-sidebar-hover); }
+.reasoning-chevron { font-size: 0.7rem; line-height: 1; }
+.reasoning-label { font-weight: 500; }
+.reasoning-hint { margin-left: auto; opacity: 0.9; }
+
+.reasoning-body {
+  margin-top: 8px;
+  padding: 0 12px 4px;
+  font-size: 0.85rem;
+  line-height: 1.7;
+  color: var(--chat-text-secondary);
+}
+.reasoning-text { margin-bottom: 10px; }
+.reasoning-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  font-size: 0.78rem;
+}
+.reasoning-metrics b { color: var(--chat-text); font-weight: 600; }
+
+/* Input —— 圆角悬浮输入框，发送/停止按钮落在框内右下角。
+   原先是一条通栏、顶部有分隔线的工具条；改成悬浮胶囊后主区不再被切一刀，
+   空会话态下输入框也才能跟着一起居中。 */
+.chat-input-container {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(var(--chat-column), calc(100% - 48px));
+  margin: 0 auto 16px;
+  padding: 10px 10px 10px 16px;
+  border: 1px solid var(--chat-rule);
+  border-radius: 22px;
+  background: var(--chat-bg);
+  box-shadow: 0 2px 12px rgba(15, 23, 42, 0.06);
+}
+/* 聚焦态描边挂在容器上（textarea 自己是无边框透明的），所以用 :focus-within */
+.chat-input-container:focus-within { border-color: var(--chat-accent); }
+
+.chat-input {
+  flex: 1;
+  padding: 8px 0;
+  border: none;
+  background: transparent;
+  color: var(--chat-text);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  resize: none;
+  outline: none;
+  font-family: inherit;
+}
+.chat-input::placeholder { color: var(--chat-text-secondary); }
+
+.btn-send,
+.btn-stop {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-family: inherit;
+  /* hover 用 brightness 而不是写第二个色值：与 .home-btn-primary:hover 同一手法，
+     省掉一个要单独验对比度的硬编码颜色。 */
+  transition: filter 0.15s ease, background 0.15s ease;
+}
+
+.btn-send {
+  background: var(--chat-accent-strong);
+  color: #fff;
+}
+/* 禁用态不能用 opacity: 0.5 —— 白字半透明压在强调蓝上只剩约 2.3:1，远低于 AA。
+   改成浅灰底 + 次要文字色（#616a76 on #e8eaed = 4.55:1，过 AA）。 */
+.btn-send:disabled {
+  background: var(--chat-rule);
+  color: var(--chat-text-secondary);
+  cursor: not-allowed;
+}
+.btn-send:not(:disabled):hover { filter: brightness(0.92); }
+
+.btn-stop {
+  background: var(--chat-surface);
+  color: var(--chat-text);
+}
+.btn-stop:hover { background: var(--chat-sidebar-active); }
+
+/* Error */
+
+.error-banner {
+  background: var(--chat-danger-soft);
+  color: var(--chat-danger);
+  padding: 10px 16px;
+  border-radius: var(--chat-radius);
+  margin: 10px 0;
+  font-size: 0.9rem;
+}
+
+/* ── 问答轮次（分享页专用）─────────────────────────────────────────
+   这一组原本是历史记录页的详情区，历史页删除后由公开分享页接管。
+   刻意保留而不是跟着删：它已经改用 --chat-* 调色板，形状（Q/A + 一行元信息）
+   正好是分享页要的，另起一套只会多一份要同步维护的样式。
+   ⚠️ .btn-delete / .history-* 那几个是历史页专有的，已随页面一起删除；
+   .btn-delete-session 是侧栏会话行的删除按钮，与这里无关，保留。 */
+
+.turn-list { display: flex; flex-direction: column; gap: 16px; }
+
+.turn-item {
+  border: 1px solid var(--chat-rule);
+  border-radius: var(--chat-radius);
+  padding: 12px 14px;
+}
+
+.turn-question { margin-bottom: 6px; font-size: 0.9rem; color: var(--chat-text); }
+.turn-answer {
+  margin-bottom: 4px;
+  font-size: 0.9rem;
+  line-height: 1.7;
+  color: var(--chat-text-secondary);
+}
+/* 元信息与正文用一条细线隔开，读数行不再和回答糊在一起 */
+.turn-meta {
+  font-size: 0.75rem;
+  color: var(--chat-text-secondary);
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--chat-rule);
+}
+
+/* ── 公开分享页（/s/:token）─────────────────────────────────────────
+   独立路由，不在 .app-layout 里，所以调色板要自己挂一份（见文件上方那条
+   .app-layout, .share-page 的变量规则）。
+   内容列宽复用 --chat-column，与对话页同一个阅读宽度。 */
+
+.share-page {
+  min-height: 100vh;
+  background: var(--chat-bg);
+  color: var(--chat-text);
+  /* 与 .chat-messages 同一写法：内容列居中用 padding-inline 而不是 max-width，
+     这样滚动条贴在视口边缘而不是内容列内侧。 */
+  padding-block: 48px;
+  padding-inline: max(24px, calc((100% - var(--chat-column)) / 2));
+}
+
+.share-header { margin-bottom: 28px; }
+
+.share-header-title {
+  font-size: 1.4rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.share-header-meta { font-size: 0.85rem; color: var(--chat-text-secondary); }
+
+.share-empty { padding: 48px 0; text-align: center; }
+.share-empty-title { font-size: 1.05rem; margin-bottom: 8px; }
+.share-empty-sub { font-size: 0.9rem; color: var(--chat-text-secondary); }
+
+.share-footer {
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid var(--chat-rule);
+}
+
+.share-disclaimer {
+  font-size: 0.8rem;
+  color: var(--chat-text-secondary);
+  margin-bottom: 12px;
+}
+
+.share-footer-links { display: flex; gap: 20px; font-size: 0.9rem; }
+.share-footer-links a { color: var(--chat-accent-strong); }
+
+/* ── 分享对话框 ─────────────────────────────────────────────────────
+   ⚠️ 它必须渲染在 .main-content 里，**不能**在 .sidebar 里。
+   侧栏只有 280px，而这个遮罩是 inset:0 的全屏浮层；窄屏抽屉态的 .sidebar 带
+   transform，会成为一个 fixed 后代的包含块 —— 全屏浮层会被压进 280px 的抽屉里。
+   z-index 取 60：高于窄屏抽屉的 40 与遮罩的 35。 */
+
+.share-dialog-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.share-dialog {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 560px;
+  /* 视口高度封顶，超出部分交给内部的 .share-turn-list 滚 —— 不然轮次一多
+     就把底部的操作按钮顶到屏幕外面去。 */
+  max-height: 100%;
+  background: #fff;
+  border-radius: var(--chat-radius);
+  box-shadow: 0 24px 64px rgba(15, 23, 42, 0.28);
+  padding: 20px;
+}
+
+.share-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.share-dialog-title { font-size: 1.05rem; font-weight: 600; }
+
+.share-dialog-close {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--chat-text-secondary);
+  font-size: 0.9rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+.share-dialog-close:hover { background: var(--chat-surface); color: var(--chat-text); }
+
+.share-dialog-hint {
+  font-size: 0.85rem;
+  color: var(--chat-text-secondary);
+  margin-bottom: 12px;
+  line-height: 1.6;
+}
+
+.share-turn-list {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid var(--chat-rule);
+  border-radius: var(--radius);
+  padding: 4px;
+  margin-bottom: 12px;
+}
+
+.share-turn {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.share-turn:hover { background: var(--chat-surface); }
+.share-turn input { margin-top: 3px; flex: none; }
+
+/* min-width:0 是省略号生效的前提（flex 项默认 min-width:auto） */
+.share-turn-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+.share-turn-q {
+  font-size: 0.85rem;
+  color: var(--chat-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 回答只给一眼，够判断「是不是这一轮」就行 —— 完整内容在分享页里 */
+.share-turn-a {
+  font-size: 0.75rem;
+  color: var(--chat-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.share-result { margin-bottom: 12px; }
+
+.share-url {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--chat-rule);
+  border-radius: var(--radius);
+  background: var(--chat-surface);
+  color: var(--chat-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  outline: none;
+}
+.share-url:focus { border-color: var(--chat-accent); }
+
+.share-dialog-error {
+  font-size: 0.85rem;
+  color: var(--chat-danger);
+  margin-bottom: 12px;
+}
+
+.share-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* 对话框的两个按钮。刻意不复用 .btn-new-session / .login-btn：前者是侧栏的
+   幽灵按钮（描边、无实心），后者是登录卡片的通栏主按钮（--primary 蓝、
+   width:100%），两个形状都不对。 */
+.btn-primary,
+.btn-secondary {
+  padding: 8px 16px;
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.btn-primary {
+  background: var(--chat-accent-strong);
+  border: 1px solid var(--chat-accent-strong);
+  color: #fff;
+}
+.btn-primary:not(:disabled):hover { filter: brightness(0.94); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-secondary {
+  background: transparent;
+  border: 1px solid var(--chat-rule);
+  color: var(--chat-text);
+}
+.btn-secondary:not(:disabled):hover { background: var(--chat-surface); }
+.btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Shared */
+
+.empty-hint {
+  text-align: center;
+  color: var(--chat-text-secondary);
+  padding: 20px;
+  font-size: 0.9rem;
+}
+
+/* Sidebar footer / settings */
+
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--chat-sidebar-rule);
+}
+
+.btn-settings {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  color: var(--chat-text-secondary);
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-family: inherit;
+}
+.btn-settings:hover { background: var(--chat-sidebar-hover); color: var(--chat-text); }
+
+/* 设置浮层（popover）—— 本仓库第一个浮层，取代了原先的 .modal-* 那一套。
+   底色用白，不用 --chat-sidebar-bg：浮层是浮在主区之上的独立表面，与侧栏
+   同色会糊成一片看不出层级；靠发丝线边框 + 轻阴影与侧栏分开。
+   这条在深色侧边栏时代是反过来的（那时用 --sidebar-active 与侧栏同色阶）。 */
+
+/* 锚点。刻意挂在按钮外面这一层 div 上而不是 .sidebar 上：.sidebar 高 100vh，
+   浮层相对它 bottom:100% 会跑到视口外面去。这一层的高度就等于按钮，
+   所以浮层正好落在按钮上方。 */
+.settings-menu {
+  position: relative;
+}
+
+.settings-caret {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: var(--chat-text-secondary);
+}
+
+.settings-popover {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  /* 浮层在侧栏内部。窄屏时侧栏是 fixed + z-index（自成层叠上下文），所以这里的
+     10 只在侧栏内部比较，不会和遮罩的 15 打架 —— 浮层始终画在遮罩之上。 */
+  z-index: 10;
+  background: #fff;
+  border: 1px solid var(--chat-rule);
+  border-radius: var(--radius);
+  padding: 6px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+}
+
+.settings-account { padding: 8px 10px; }
+
+.settings-account-name {
+  font-size: 0.85rem;
+  color: var(--chat-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-divider {
+  height: 1px;
+  background: var(--chat-rule);
+  margin: 6px 0;
+}
+
+.settings-item {
+  display: flex;
+  /* 原先两项各带一行小字说明，所以要 flex-start 让图标对齐第一行；说明文字删掉
+     之后每一项只剩单行标签，改成 center 才不会让图标比文字高半个字。 */
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius);
+  color: var(--chat-text-secondary);
+  font-size: 0.85rem;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.settings-item:hover { background: var(--chat-sidebar-hover); }
+
+.settings-item-icon { flex: none; line-height: 1.3; }
+
+.settings-item-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+.settings-item-label { color: var(--chat-text); }
+
+/* 「退出」比「切换账号」多清一个全局访问令牌（连访问密码那道门一起关掉），后果
+   不同，所以用红色单独标出来，避免误点。
+   这里曾用 #fca5a5 —— 那是为深色浮层 (#334155) 选的。侧栏改浅色后依据整个反转：
+   #fca5a5 在白底上只剩 1.72:1，几乎看不见。改用 --chat-danger (#b91c1c)，
+   在浮层白底上 6.47:1，过 AA。 */
+.settings-item.danger .settings-item-label { color: var(--chat-danger); }
+.settings-item.danger:hover { background: var(--chat-danger-soft); }
+
+/* Login Page */
+
+.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+}
+
+.login-card {
+  background: #fff;
+  border-radius: 16px;
+  padding: 48px 40px;
+  width: 400px;
+  max-width: 90vw;
+  text-align: center;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.3);
+}
+
+.login-card h1 {
+  font-size: 1.6rem;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.login-subtitle {
+  color: var(--text-secondary);
+  margin-bottom: 28px;
+  font-size: 0.95rem;
+}
+
+.login-input {
+  width: 100%;
+  padding: 14px 16px;
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 1rem;
+  outline: none;
+  font-family: inherit;
+  text-align: center;
+  letter-spacing: 4px;
+}
+.login-input:focus { border-color: var(--primary); }
+
+/* 验证码输入框。复用它上面的居中与字距是刻意的 —— .login-input 的
+   text-align:center/letter-spacing:4px 是给访问码设计的，其余调用方都在写内联
+   letterSpacing:0 去对抗它（.title-input 另立一个类也是因为在那儿复用它错了），
+   而等宽数字的 6 位码是它唯一正确的场合。这里只调字号与字距。 */
+.login-code {
+  font-size: 1.4rem;
+  letter-spacing: 8px;
+  font-variant-numeric: tabular-nums;
+  /* letter-spacing 在最后一个字符后面也加了一份空隙，居中的是行盒而不是字形，
+     所以字面看起来会偏左 letter-spacing/2。补回来。 */
+  text-indent: 4px;
+}
+
+.login-error {
+  color: var(--danger);
+  font-size: 0.85rem;
+  margin-top: 12px;
+}
+
+.login-btn {
+  width: 100%;
+  margin-top: 20px;
+  padding: 14px;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 1rem;
+  cursor: pointer;
+  font-family: inherit;
+}
+.login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.login-btn:not(:disabled):hover { opacity: 0.9; }
+
+/* Home Page (public) */
+
+/* 这里原有 .sidebar-brand-link（字标做成回主页的链接，照 logo 点回首页的惯例）
+   与 .nav-link-home。两者都已删除：字标改回纯文本，返回主页由品牌行左侧的
+   ← 与浮动按钮组里的 ← 承担 —— 品牌字标挂在侧栏最显眼的位置，误点就直接
+   离开应用，不该让它承担导航。 */
+
+/* ── 对话界面的响应式 ────────────────────────────────────────────────
+   独立成块，且块内只允许出现 .sidebar / .sidebar-* / .main-content / .chat-* /
+   .example-questions / .message-* 这些对话界面专有的选择器。
+
+   文件末尾那个 720px 的块是主页专用的，它的注释（见下）要求那里只能出现
+   .home-*。两个方向上的约束是同一条：断点块里混进无作用域的选择器，
+   会同时波及公开主页与登录页 —— 而这两个界面本次明确不动。
+
+   900px 取在内容列 800px 之上一档：低于它，800px 的列已经放不下，
+   该把侧栏让出来。 */
+@media (max-width: 900px) {
+  /* 侧栏改为抽屉：脱离文档流、靠 transform 移出视口，而不是收成 0 宽 ——
+     0 宽的抽屉是打不开的。 */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 40;
+    width: 280px;
+    transition: transform 0.2s ease;
+    box-shadow: 0 8px 32px rgba(15, 23, 42, 0.18);
+  }
+  /* 逐条覆盖基础折叠块：抽屉的隐藏靠 transform，width / padding / border /
+     overflow 都得还原。overflow 尤其不能漏 —— 基础的 hidden 会把「⚙ 设置」
+     浮层整个裁掉（它在抽屉里，而抽屉是全高的）。 */
+  .app-layout.sidebar-collapsed .sidebar {
+    width: 280px;
+    padding: 16px;
+    border-right: 1px solid var(--chat-sidebar-rule);
+    overflow: visible;
+    transform: translateX(-100%);
+    box-shadow: none;
+  }
+
+  .sidebar-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 35;
+    background: rgba(15, 23, 42, 0.32);
+    border: none;
+  }
+  .app-layout.sidebar-collapsed .sidebar-scrim { display: none; }
+
+  /* 浮动按钮组占了左上角 12+36px。窄屏下内容列只剩 24px 边距，正文会钻到
+     按钮底下，所以给这个滚动容器让出头部空间。
+     ⚠️ 这里**只有** .chat-messages 一个选择器：历史页已删，而新增的公开分享页
+     虽然也复用 --chat-* 调色板，却没有左上角那组按钮（它不在 .app-layout 里），
+     加成 .share-page 会平白多出 64px 空白。 */
+  .chat-messages { padding-top: 64px; }
+}
+
+@media (max-width: 640px) {
+  .chat-welcome-title { font-size: 1.25rem; }
+  /* 窄屏上气泡再收 80% 就太窄了，长句会被拆成一列短行 */
+  .message-user .message-body { max-width: 92%; }
+}
+
+/* ---- 主页本身 ----
+   主页是公开面，气质上要和问答应用区分开：暖白纸张而非冷灰、衬线标题而非
+   无衬线、发丝线而非阴影、4px 直角而非 8/12px 圆角、留白放大。
+   所有变量都作用域在 .home-page 上，一条声明都不会漏进应用里；
+   强调色仍然取自全局 --primary，所以两边是同一套色。
+   注意：本节的 media query 只能出现 .home-* 选择器。对话界面自 2026-09 起
+   也有了自己的断点（900 / 640，见上方独立成块的那两段），两个界面各管各的；
+   这里混进无作用域的选择器，会同时波及对话界面与登录页。 */
+.home-page {
+  --home-paper: #fbfaf8;
+  --home-ink: #14181f;
+  --home-muted: #5d6673;
+  --home-rule: #e6e2da;
+  --home-accent: var(--primary);
+  --home-radius: 4px;
+  --home-max: 1080px;
+  --home-serif: 'Songti SC', 'Noto Serif SC', 'Source Han Serif SC', Georgia, 'Times New Roman', serif;
+
+  min-height: 100vh;
+  background: var(--home-paper);
+  color: var(--home-ink);
+}
+
+.home-nav,
+.home-hero,
+.home-section,
+.home-footer {
+  max-width: var(--home-max);
+  margin: 0 auto;
+  padding-inline: 24px;
+}
+
+.home-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding-block: 20px;
+  border-bottom: 1px solid var(--home-rule);
+}
+
+.home-brand {
+  font-family: var(--home-serif);
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
+  color: var(--home-ink);
+  text-decoration: none;
+}
+
+.home-nav-links {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.home-nav-link {
+  color: var(--home-muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+.home-nav-link:hover { color: var(--home-accent); }
+.home-nav-enter { color: var(--home-accent); }
+
+/* 「退出登录」是按钮不是链接 —— 它执行动作而不是导航。复用 .home-nav-link 的
+   颜色规则，这里只补上按钮重置，否则它会顶着浏览器默认样式出现在导航里。 */
+.home-nav-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+/* 已登录时导航上显示的账号名。只读，所以不做成控件；截断是为了不把
+   「进入系统」挤出视口（长邮箱很常见）。 */
+.home-nav-account {
+  color: var(--home-ink);
+  font-size: 0.9rem;
+  max-width: 12em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-hero {
+  padding-block: 96px 72px;
+  max-width: 820px;
+}
+
+.home-eyebrow {
+  font-size: 0.78rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--home-muted);
+  padding-bottom: 14px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--home-rule);
+  display: inline-block;
+}
+
+.home-title {
+  font-family: var(--home-serif);
+  font-size: clamp(2.2rem, 5vw, 3.4rem);
+  font-weight: 600;
+  line-height: 1.18;
+  letter-spacing: -0.01em;
+  margin-bottom: 20px;
+}
+
+.home-lede {
+  font-size: 1.02rem;
+  line-height: 1.8;
+  color: var(--home-muted);
+  max-width: 640px;
+  margin-bottom: 36px;
+}
+
+.home-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.home-btn {
+  display: inline-block;
+  padding: 11px 22px;
+  border-radius: var(--home-radius);
+  font-size: 0.94rem;
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+.home-btn-primary {
+  background: var(--home-accent);
+  color: #fff;
+}
+.home-btn-primary:hover { filter: brightness(0.92); }
+.home-btn-ghost {
+  color: var(--home-ink);
+  border-color: var(--home-rule);
+}
+.home-btn-ghost:hover { border-color: var(--home-accent); color: var(--home-accent); }
+
+.home-section { padding-block: 64px; }
+
+.home-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 16px;
+  margin-bottom: 28px;
+  border-bottom: 1px solid var(--home-rule);
+}
+
+.home-section-title {
+  font-family: var(--home-serif);
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.home-section-note {
+  font-size: 0.82rem;
+  color: var(--home-muted);
+}
+
+.home-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 20px;
+}
+
+.home-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 26px;
+  background: #fff;
+  border: 1px solid var(--home-rule);
+  border-radius: var(--home-radius);
+  color: inherit;
+  text-decoration: none;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.home-card-live:hover {
+  transform: translateY(-2px);
+  border-color: var(--home-accent);
+  box-shadow: 0 8px 24px rgba(20, 24, 31, 0.07);
+}
+
+/* 占位卡片：与可用卡片同样的盒模型，只靠色调和虚线区分，
+   这样网格读起来还是一套东西 */
+.home-card-planned {
+  background: #f5f4f1;
+  border-style: dashed;
+  color: var(--home-muted);
+  cursor: default;
+}
+
+.home-card-icon { font-size: 1.6rem; line-height: 1; }
+
+.home-card-title {
+  font-family: var(--home-serif);
+  font-size: 1.18rem;
+  font-weight: 600;
+}
+
+.home-card-desc {
+  font-size: 0.9rem;
+  line-height: 1.7;
+  color: var(--home-muted);
+}
+
+.home-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.home-tag {
+  font-size: 0.72rem;
+  color: var(--home-muted);
+  border: 1px solid var(--home-rule);
+  border-radius: 999px;
+  padding: 2px 9px;
+}
+
+.home-card-cta {
+  margin-top: auto;
+  padding-top: 8px;
+  color: var(--home-accent);
+  font-size: 0.88rem;
+}
+
+.home-badge-soon {
+  align-self: flex-start;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  color: var(--home-muted);
+  border: 1px solid var(--home-rule);
+  border-radius: 999px;
+  padding: 3px 9px;
+}
+
+.home-about {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 28px;
+}
+
+.home-capability-title {
+  font-family: var(--home-serif);
+  font-size: 1.02rem;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.home-capability-body {
+  font-size: 0.9rem;
+  line-height: 1.75;
+  color: var(--home-muted);
+}
+
+.home-footer {
+  padding-block: 40px 56px;
+  margin-top: 32px;
+  border-top: 1px solid var(--home-rule);
+}
+
+.home-footer-note {
+  font-size: 0.8rem;
+  color: var(--home-muted);
+}
+
+@media (max-width: 720px) {
+  .home-hero { padding-block: 56px 40px; }
+  .home-title { font-size: clamp(1.9rem, 8vw, 2.4rem); }
+  .home-lede { font-size: 0.96rem; }
+  .home-actions { flex-direction: column; align-items: stretch; }
+  .home-btn { text-align: center; }
+  .home-grid,
+  .home-about { grid-template-columns: 1fr; }
+  .home-nav { gap: 12px; }
+  .home-nav-links { gap: 12px; font-size: 0.85rem; }
+  .home-section { padding-block: 44px; }
+}

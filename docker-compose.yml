@@ -22,6 +22,10 @@ services:
     container_name: milvus-minio
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     environment:
+      # minioadmin / minioadmin 是镜像的出厂默认值，留在这里只是为了让首次
+      # `docker compose up` 免配置能跑通，**不是**一份可用的凭据。之所以能接受，
+      # 是因为下面两个端口只绑回环，MinIO 不对局域网与公网开放。
+      # 一旦要让别的机器访问它，务必在 .env 里换成真实值。
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
     ports:
@@ -202,8 +206,14 @@ services:
         # 头 30–60 秒的请求全是 502。
         condition: service_healthy
     restart: unless-stopped
-    # 同样不开 ports:。隧道是纯出站连接（QUIC/7844，可回落 HTTP/2 over 443），
+    # 不开 ports:。隧道是纯出站连接（QUIC/7844，可回落 HTTP/2 over 443），
     # 宿主机无需任何入站端口。
+    #
+    # 不显式写 networks: —— 让它只加入 default，那里有 `api`，够用了。
+    # 若要再挂一个应用进来，这里补 networks: 并把回源容器也接入同一张网，
+    # 但**先确认两张网上没有同名服务**：Docker 的内嵌 DNS 会在容器接入的所有
+    # 网络里查名字，重名时解析结果不确定，表现是回源时通时不通、偶尔还回到
+    # 另一个服务上（README「公网部署」一节写得更细）。
 
 volumes:
   rag_state:

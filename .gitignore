@@ -96,9 +96,17 @@ data/
 # 面试准备与技术复盘笔记，含个人求职内容
 docs/
 
-# ── 前端（独立仓库 -> Dyk-DD.github.io）────────────────────────────
-frontend/
+# ── 前端 ─────────────────────────────────────────────────────────
+# frontend/ 源码随本仓库一起提交，这里只挡它的构建产物。node_modules/ 与
+# dist/ 两处规则写在上面、都没带斜杠，因此匹配任意层级，已覆盖 frontend/ 下
+# 的同名目录。
 node_modules/
+
+# ⚠️ 同样因为「没带斜杠」，上面 Python 那段的 lib/ 会连带匹配 frontend/src/lib/。
+# 那是前端的**源码**目录（策略中文名与百分比格式化，RoutingCard / SharePage
+# 共用），不是构建产物，必须显式收回。少了这行，仓库里会缺一个被 import 的
+# 文件 —— 本地有磁盘上的副本所以 tsc 能过，克隆者则直接构建失败。
+!frontend/src/lib/
 
 # ── Docker ───────────────────────────────────────────────────────
 # Milvus / MinIO / etcd 运行时卷
@@ -107,15 +115,9 @@ volumes/
 # 不进版本控制：主 compose 文件刻意不发布任何端口，公网只走隧道。
 docker-compose.override.yml
 
-# ── 评估与策略对比的产物 ──────────────────────────────────────────
-# 只挡产物，不挡代码：evaluate.py / strategy_comparison/*.py 等脚本要提交。
-# 报告内含 system_info（连接配置、库统计），历史上曾把 neo4j 密码原样
-# 写进 JSON，因此一律不纳入版本控制。
+# ── 评测产物 ─────────────────────────────────────────────────────
+# 评测脚本不在本次开源范围内。若自行补回，切记报告 JSON 里通常带 system_info
+# （连接配置、库统计），历史上曾把数据库密码原样写进 JSON —— 这类产物一律
+# 不纳入版本控制。
 scripts/**/*_report.json
 scripts/**/evaluation_report*.json
-scripts/strategy_comparison/*.txt
-scripts/**/comparison_summary.txt
-# 采样的测试集（可由 sample_testset.py 重新生成）
-scripts/**/sampled_*.csv
-# 排障时的一次性脚本
-scripts/strategy_comparison/debug_*.py

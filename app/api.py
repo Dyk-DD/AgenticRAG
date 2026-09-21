@@ -185,7 +185,8 @@ app.add_middleware(
         o.strip()
         for o in _env(
             "CORS_ORIGINS",
-            "http://localhost:5173,http://127.0.0.1:5173,https://dyk-dd.github.io",
+            # 默认只开本地 vite dev server。前端若部署到别的源，用环境变量加。
+            "http://localhost:5173,http://127.0.0.1:5173",
         ).split(",")
         if o.strip()
     ],

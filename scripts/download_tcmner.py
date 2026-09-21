@@ -6,7 +6,7 @@
     python scripts/download_tcmner.py --model Monor/TCMNER  # 可选其他模型
     python scripts/download_tcmner.py --help
 
-输出目录：E:\AI_Project\Agentic-RAG\models\TCMNER\
+输出目录：<项目根>/models/TCMNER/
 """
 import os
 import sys

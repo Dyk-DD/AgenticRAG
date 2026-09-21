@@ -90,8 +90,7 @@ def _prune_email_codes(conn: sqlite3.Connection) -> None:
     """删掉过期超过 CODE_RETENTION_SECONDS 的验证码行。
 
     ⚠️ 本函数只含一条 DELETE，只针对一个硬编码的表名。**不要**把它泛化成
-    「遍历一批表名」或「接受表名参数」—— scripts/clear_test_data.py 的 TABLES
-    列表正是那种形状，照抄过来等于重新制造「一次调用删掉多张表」的风险。
+    「遍历一批表名」或「接受表名参数」——那正是「一次调用删掉多张表」的形状。
     本模块已经有过一次因为清理谓词写错而静默毁数据的先例。
     """
     conn.execute(
