@@ -210,15 +210,20 @@ docker compose up -d
 ### 3. 安装依赖
 
 ```bash
-conda activate all-in-rag   # 或创建新环境
+conda activate agentic-rag   # 换成你自己的环境名
 pip install -r requirements.txt
 ```
 
-### 4. 下载嵌入模型（可选，已内置）
+### 4. 下载嵌入模型
 
 ```bash
-python scripts/download_model.py
+python scripts/download_model.py                  # bge-base-zh-v1.5，默认，约 390 MB
+python scripts/download_model.py --model bge-m3   # 换用 bge-m3，约 4.3 GB
 ```
+
+模型不随仓库分发（`models/` 在 `.gitignore` 里），**不下载则检索无法启动**。
+换用 bge-m3 还要同步把 `app/config.py` 的 `embedding_dimension` 从 768 改成
+1024 并重建向量索引 —— 两个模型维度不同，混用会在插入时报维度不匹配。
 
 ### 5. 运行
 
